@@ -1,0 +1,39 @@
+# User-supplied game media and extracted game code.
+*.iso
+*.ISO
+*.cso
+*.CSO
+*.pbp
+*.PBP
+*.prx
+*.PRX
+
+# Local user-supplied disc folder and selected ISO path.
+/Metal Gear Solid - Portable Ops (USA)/
+/config/mgspo_iso_path.txt
+
+# Generated recompilation, extracted disc, native build, and runtime output.
+/build/
+/out/
+/gen/
+/memstick/
+/dispatch_dump.bin
+/edram.bin
+
+# Reverse-engineering projects and local reports containing derived code.
+*.gpr
+*.rep
+*.db
+*.log
+/.vs/
+/.vscode/
+/devdocs/
+
+# Nested toolkit output.
+/external/psp-recomp/build/
+/external/psp-recomp/.pytest_cache/
+
+# Python caches.
+__pycache__/
+*.pyc
+.pytest_cache/

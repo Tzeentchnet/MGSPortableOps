@@ -1,0 +1,49 @@
+# Metal Gear Solid: Portable Ops (USA), ULUS-10202 v1.00.
+
+[runtime]
+repository = "https://github.com/Tzeentchnet/psp-recomp.git"
+branch = "main"
+commit = "b56ff30ef5997b9f168209df8c33156e82402e7b"
+
+[disc]
+id = "ULUS10202"
+version = "1.00"
+iso_size = 1393426432
+iso_sha1 = "706191720f78fe639eac20d3302d03b36a88e8e9"
+plaintext_module_roots = [
+  "PSP_GAME/USRDIR/modules",
+  "PSP_GAME/USRDIR/stage",
+]
+
+[disc.files]
+"PSP_GAME/SYSDIR/BOOT.BIN" = "8cf6d47bc812be7a8cfcd3c9d35b5cd53d8fff7d"
+"PSP_GAME/SYSDIR/EBOOT.BIN" = "a82d16ef4a4db93b4217429a4e2ffa16f160fc3d"
+"PSP_GAME/PARAM.SFO" = "240b50afd9bf0139ee5bdc9131416c383d208f76"
+"UMD_DATA.BIN" = "2a7257d86e272b5f057775fd6dfd96c30dc370df"
+
+[module]
+file = "PSP_GAME/SYSDIR/BOOT.BIN"
+name = "mgp_main"
+base = 0x08804000
+entry = 0x08804128
+gp = 0x08a07e90
+text_size = 0x1d6828
+image_size = 0x2f77c0
+function_entries = []
+
+# The start-thread state must be measured from a PPSSPP interpreter trace
+# before a standalone boot target is enabled.
+[module.start_thread]
+verified = false
+
+[analysis]
+discovered_functions = 19671
+import_stubs = 240
+import_libraries = 32
+excluded_false_entries = [
+  0x088749ad,
+  0x08901fe4,
+  0x08901ffc,
+  0x08902000,
+  0x0896e664,
+]
