@@ -30,11 +30,17 @@ def parse_args(argv):
 
 
 def write_entry(entry, data, output_root):
-    iso_path = entry.path.lstrip("/")
-    destination = output_root.joinpath(*iso_path.split("/"))
+    destination = disc_destination(output_root, entry.path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_bytes(data)
     return destination
+
+
+def disc_destination(output_root, iso_path):
+    parts = Path(iso_path.lstrip("/")).parts
+    if not parts or any(part in ("", ".", "..") for part in parts):
+        raise ValueError(f"unsafe ISO path: {iso_path}")
+    return output_root.joinpath(*parts)
 
 
 def module_kind(data):
@@ -73,8 +79,7 @@ def extract_iso(argv):
     )
     records = []
     failures = []
-    pending = []
-    extracted = set()
+    all_files = []
     with Iso(args.iso) as iso:
         for iso_path, expected_hash in expected_files.items():
             entry = iso.lookup(iso_path)
@@ -84,14 +89,15 @@ def extract_iso(argv):
                 failures.append(
                     f"{iso_path}: {actual_hash} != {expected_hash}"
                 )
-            extracted.add(iso_path.upper())
-            pending.append((entry, data))
             print(
                 f"  {iso_path:<52} {len(data):>10,} "
                 f"{actual_hash}"
             )
 
-        for entry in sorted(iso.files(), key=lambda value: value.path.upper()):
+        all_files = sorted(
+            iso.files(), key=lambda value: value.path.upper()
+        )
+        for entry in all_files:
             iso_path = entry.path.lstrip("/")
             upper = iso_path.upper()
             if not upper.endswith(".PRX") or not upper.startswith(roots):
@@ -108,25 +114,25 @@ def extract_iso(argv):
                     "kind": kind,
                 }
             )
-            if upper not in extracted:
-                pending.append((entry, data))
-                print(
-                    f"  {iso_path:<52} {len(data):>10,} "
-                    f"{actual_hash} {kind}"
-                )
+            print(
+                f"  {iso_path:<52} {len(data):>10,} "
+                f"{actual_hash} {kind}"
+            )
 
     if failures:
         raise ValueError("; ".join(failures))
 
     args.out.mkdir(parents=True, exist_ok=True)
-    for entry, data in pending:
-        write_entry(entry, data, args.out)
+    with Iso(args.iso) as iso:
+        for entry in all_files:
+            write_entry(entry, iso.read(entry), args.out)
     inventory_path = args.out.parent / "disc_inventory.json"
     inventory_path.write_text(
         json.dumps(
             {
                 "iso_size": actual_size,
                 "iso_sha1": actual_sha1,
+                "tree_files": len(all_files),
                 "files": records,
             },
             indent=2,
@@ -136,7 +142,10 @@ def extract_iso(argv):
     )
     plaintext = sum(item["kind"] == "elf" for item in records)
     encrypted = sum(item["kind"] == "encrypted" for item in records)
-    print(f"wrote {args.out}: {plaintext} plaintext and {encrypted} encrypted PRXs")
+    print(
+        f"wrote {args.out}: {len(all_files)} files, "
+        f"{plaintext} plaintext and {encrypted} encrypted PRXs"
+    )
     print(f"wrote {inventory_path}")
     return 0
 

@@ -5,6 +5,46 @@ repository = "https://github.com/Tzeentchnet/psp-recomp.git"
 branch = "main"
 commit = "b56ff30ef5997b9f168209df8c33156e82402e7b"
 
+[oracle.ppsspp]
+repository = "https://github.com/hrydgard/ppsspp.git"
+version = "1.20.4"
+commit = "fa50bb1976065c4f8b1b47af227d367fe9771555"
+patch = "tools/mgspo/ppsspp/boot_oracle.patch"
+trace_format = 1
+trace_steps = 100000
+
+[oracle.ppsspp.build]
+target = "PPSSPPHeadless"
+generator = "Ninja"
+configuration = "Release"
+architecture = "x64"
+compiler = "msvc"
+cmake_options = ["HEADLESS=ON"]
+
+[oracle.ppsspp.settings]
+cpu_core = "interpreter"
+graphics = "software"
+sound = false
+fast_forward = true
+ignore_bad_memory_access = true
+software_renderer_jit = true
+vertex_decoder_jit = true
+force_hle = true
+psp_model = "slim"
+firmware_version = 660
+language = "english"
+time_format = "24h"
+date_format = "ddmmyyyy"
+timezone_minutes = 60
+rtc_epoch_seconds = 946684800
+button_preference = "cross"
+nickname = "shadow"
+parental_level = 9
+memstick_inserted = true
+memstick_size_gb = 16
+wlan = true
+mac_address = "12:34:56:78:9A:BC"
+
 [disc]
 id = "ULUS10202"
 version = "1.00"
@@ -21,6 +61,20 @@ plaintext_module_roots = [
 "PSP_GAME/PARAM.SFO" = "240b50afd9bf0139ee5bdc9131416c383d208f76"
 "UMD_DATA.BIN" = "2a7257d86e272b5f057775fd6dfd96c30dc370df"
 
+[smoke.first_mission]
+route = "config/routes/first-mission.pad"
+present = 7200
+analog_start = 6200
+analog_end = 6900
+frame_region = [0, 0, 240, 272]
+frame_region_sha256 = "39751fb212b51863b6d2dbb2d4c1861e022cf4c6c983573998c161ff14ad0ae3"
+native_frame_region_sha256 = "39751fb212b51863b6d2dbb2d4c1861e022cf4c6c983573998c161ff14ad0ae3"
+unpaused_turbo_frame_sha256 = "18ecd9c440369e54ea3e4c49704e485bb707c41316aa2b242e369e92527c917d"
+module = "PSP_GAME/USRDIR/stage/st04vo/st04vo.prx"
+module_sha1 = "7a32951a2e07132b4a92cabfb2c3a156ff5e205c"
+raw_path = "disc0:/sce_lbn0x68110_size0x10c724"
+load_base = 0x08b86f00
+
 [module]
 file = "PSP_GAME/SYSDIR/BOOT.BIN"
 name = "mgp_main"
@@ -31,10 +85,153 @@ text_size = 0x1d6828
 image_size = 0x2f77c0
 function_entries = []
 
-# The start-thread state must be measured from a PPSSPP interpreter trace
-# before a standalone boot target is enabled.
+# Measured independently from two matching 100,000-instruction PPSSPP
+# interpreter captures. Raw captures remain private under build/mgspo/oracle.
 [module.start_thread]
-verified = false
+verified = true
+module_uid = 0x112
+uid = 0x113
+priority = 0x20
+stack_start = 0x09fffc00
+stack_size = 0x400
+attr = 0x80000000
+effective_attr = 0x800000ff
+next_uid = 0x114
+initial_ge_list_id = 0
+initial_hcount = 10
+argument_hex = "64697363303a2f5053505f47414d452f5359534449522f45424f4f542e42494e00"
+argument_address = 0x09fffed0
+initial_sp = 0x09fffe90
+initial_k0 = 0x09ffff00
+initial_ra = 0x08000030
+initial_gpr_fill = 0xdeadbeef
+initial_hi = 0xdeadbeef
+initial_lo = 0xdeadbeef
+initial_fcr31 = 0x00000e00
+initial_fpcond = 0
+initial_fpr_fill_bits = 0x7f800001
+initial_vfpu_fill_bits = 0
+prepared_stack_sha256 = "d0e481fc998fd1c30806c46271b8cd9174896535fa03610a5a928e4ad0e2935c"
+initial_vfpu_control = [
+  0x000000e4, 0x000000e4, 0x00000000, 0x0000003f,
+  0x00000000, 0x00000000, 0x00000000, 0x7772ceab,
+  0x3f800001, 0x3f800002, 0x3f800004, 0x3f800008,
+  0x3f800000, 0x3f800000, 0x3f800000, 0x3f800000,
+]
+
+[native_modules.zlib]
+file = "PSP_GAME/USRDIR/modules/zlibdec.prx"
+name = "ZLIB"
+sha1 = "518c64f39a7492340cdcc3411044d555a4faae8d"
+base = 0x08b20000
+symbol_prefix = "mgspo_zlib"
+functions = 118
+
+[plaintext_modules.zlib]
+path = "disc0:/PSP_GAME/USRDIR/modules/zlibdec.prx"
+uid = 0x11b
+base = 0x08b20000
+size = 0x4100
+entry = 0x08b216b4
+gp = 0x08b2c090
+module_start = 0x08b216b4
+module_stop = 0x08b216bc
+start_priority = 0x20
+start_stack_size = 0x40000
+start_attributes = 0
+
+[plaintext_modules.zlib.start_thread]
+uid = 0x11c
+name = "ZLIB"
+creation_gp = 0x08a07e90
+stack_start = 0x09fc0000
+stack_size = 0x40000
+attributes = 0
+sp = 0x09fffec0
+k0 = 0x09ffff00
+ra = 0x08000030
+exit_status = 0
+
+[plaintext_modules.zlib.stop_thread]
+uid = 0x128
+name = "ZLIB"
+creation_gp = 0x08a07e90
+stack_start = 0x09fc0000
+stack_size = 0x40000
+attributes = 0
+sp = 0x09fffec0
+k0 = 0x09ffff00
+ra = 0x08000030
+exit_status = 0
+
+[plaintext_modules.sound2]
+path = "disc0:/PSP_GAME/USRDIR/modules/sound2.prx"
+uid = 0x11e
+base = 0x08b24100
+size = 0x51400
+entry = 0xffffffff
+gp = 0x08b45180
+module_start = 0
+module_stop = 0
+start_priority = 0x20
+start_stack_size = 0x40000
+start_attributes = 0
+
+[plaintext_modules.kjfs]
+path = "disc0:/PSP_GAME/USRDIR/modules/kjfs.prx"
+sha1 = "ed7376c5e42652f6554f664621e257a5c9ad26c6"
+uid = 0x120
+base = 0x08b75500
+size = 0x11a00
+entry = 0x08b77ae8
+gp = 0x08b8b9e0
+module_start = 0x08b77ae8
+module_stop = 0x08b77c24
+start_priority = 0x20
+start_stack_size = 0x40000
+start_attributes = 0
+
+[plaintext_modules.kjfs.start_thread]
+uid = 0x121
+name = "KCEJ_FS"
+creation_gp = 0x08a07e90
+stack_start = 0x09fc0000
+stack_size = 0x40000
+attributes = 0
+sp = 0x09fffec0
+k0 = 0x09ffff00
+ra = 0x08000030
+exit_status = 0
+
+[[plaintext_modules.kjfs.worker_threads]]
+uid = 0x122
+name = "preseek"
+entry = 0x08b779d0
+priority = 0x11
+stack_start = 0x08f9dc00
+stack_size = 0x2000
+attributes = 0
+
+[[plaintext_modules.kjfs.worker_threads]]
+uid = 0x125
+name = "dbr"
+entry = 0x08b7711c
+priority = 0x12
+stack_start = 0x08f9c400
+stack_size = 0x1800
+attributes = 0
+
+[plaintext_modules.kjfs.stop_thread]
+uid = 0x127
+name = "KCEJ_FS"
+creation_gp = 0x08a07e90
+stack_start = 0x09fc0000
+stack_size = 0x40000
+attributes = 0
+sp = 0x09fffec0
+k0 = 0x09ffff00
+ra = 0x08000030
+exit_status = 0
 
 [analysis]
 discovered_functions = 19671

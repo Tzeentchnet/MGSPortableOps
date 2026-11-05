@@ -3,7 +3,7 @@
   "configurePresets": [
     {
       "name": "clang-cl",
-      "displayName": "clang-cl (x64, Release bootstrap)",
+      "displayName": "clang-cl (x64, Release)",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/out/build/${presetName}",
       "architecture": {
@@ -17,12 +17,31 @@
       "cacheVariables": {
         "CMAKE_C_COMPILER": "clang-cl",
         "CMAKE_CXX_COMPILER": "clang-cl",
-        "CMAKE_BUILD_TYPE": "Release"
+        "CMAKE_BUILD_TYPE": "Release",
+        "MGSPO_ENABLE_INSTRUCTION_TRACE": "OFF"
       },
       "condition": {
         "type": "equals",
         "lhs": "${hostSystemName}",
         "rhs": "Windows"
+      }
+    },
+    {
+      "name": "clang-cl-trace",
+      "displayName": "clang-cl (x64, Release 100k trace)",
+      "inherits": "clang-cl",
+      "binaryDir": "${sourceDir}/out/build/${presetName}",
+      "cacheVariables": {
+        "MGSPO_ENABLE_INSTRUCTION_TRACE": "ON"
+      }
+    },
+    {
+      "name": "clang-cl-d3d12-experimental",
+      "displayName": "clang-cl (x64, Release experimental D3D12)",
+      "inherits": "clang-cl",
+      "binaryDir": "${sourceDir}/out/build/${presetName}",
+      "cacheVariables": {
+        "MGSPO_ENABLE_D3D12": "ON"
       }
     }
   ],
@@ -32,6 +51,27 @@
       "configurePreset": "clang-cl",
       "targets": [
         "mgspo_bootstrap"
+      ]
+    },
+    {
+      "name": "mgspo-runtime",
+      "configurePreset": "clang-cl",
+      "targets": [
+        "mgspo"
+      ]
+    },
+    {
+      "name": "mgspo-trace",
+      "configurePreset": "clang-cl-trace",
+      "targets": [
+        "mgspo"
+      ]
+    },
+    {
+      "name": "mgspo-d3d12-experimental",
+      "configurePreset": "clang-cl-d3d12-experimental",
+      "targets": [
+        "mgspo"
       ]
     }
   ]

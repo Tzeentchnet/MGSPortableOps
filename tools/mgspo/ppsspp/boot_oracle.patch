@@ -1,0 +1,1891 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 910f32214e4ff26e4988ae87c8371933da62dca3..06c0e678785a7019691ca871928b55ebc92ab453 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -2176,6 +2176,8 @@ add_library(${CoreLibName} ${CoreLinkType}
+ 	Core/Debugger/DebugInterface.h
+ 	Core/Debugger/MemBlockInfo.cpp
+ 	Core/Debugger/MemBlockInfo.h
++	Core/Debugger/PSPRecompOracle.cpp
++	Core/Debugger/PSPRecompOracle.h
+ 	Core/Debugger/SymbolMap.cpp
+ 	Core/Debugger/SymbolMap.h
+ 	Core/Debugger/Watch.h
+@@ -2952,6 +2954,9 @@ if(HEADLESS)
+ 	endif()
+ 	add_executable(PPSSPPHeadless ${HeadlessSource})
+ 	target_link_libraries(PPSSPPHeadless ${COCOA_LIBRARY} ${QUARTZ_CORE_LIBRARY} ${IOKIT_LIBRARY} ${LinkCommon})
++	if(WIN32)
++		target_link_libraries(PPSSPPHeadless comctl32 mfplat mfuuid)
++	endif()
+ 	setup_target_project(PPSSPPHeadless headless)
+ endif()
+ 
+diff --git a/Core/Debugger/PSPRecompOracle.cpp b/Core/Debugger/PSPRecompOracle.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..521db15d7cbe73deb8d0506370e97cf5abf58e57
+--- /dev/null
++++ b/Core/Debugger/PSPRecompOracle.cpp
+@@ -0,0 +1,1495 @@
++// Copyright (c) 2012- PPSSPP Project.
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "Core/Debugger/PSPRecompOracle.h"
++
++#include <cerrno>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++
++#include "Core/Core.h"
++#include "Core/HLE/sceKernel.h"
++#include "Core/HLE/sceKernelMemory.h"
++#include "Core/HLE/sceKernelModule.h"
++#include "Core/HLE/sceKernelThread.h"
++#include "Core/MemMap.h"
++#include "Core/MIPS/MIPS.h"
++#include "Core/MIPS/MIPSTables.h"
++#include "GPU/GPU.h"
++#include "GPU/GPUCommon.h"
++
++namespace {
++
++constexpr unsigned long long MAX_TRACE_STEPS = 50000000ULL;
++constexpr size_t MAX_KJFS_CALLS = 64;
++
++struct KJFSCall {
++	int thread = 0;
++	u32 nid = 0;
++	u32 returnPC = 0;
++	u32 args[4]{};
++};
++
++struct OracleState {
++	bool configured = false;
++	bool enabled = false;
++	bool active = false;
++	bool stepActive = false;
++	bool eventsOnly = false;
++	u32 startPC = 0;
++	unsigned long long limit = 0;
++	unsigned long long step = 0;
++	u32 pc = 0;
++	u32 op = 0;
++	u32 memAddress = 0;
++	int memSize = 0;
++	u32 r[32]{};
++	u32 fi[32]{};
++	u32 vi[128]{};
++	u32 hi = 0;
++	u32 lo = 0;
++	u32 fcr31 = 0;
++	std::string directory;
++	std::string target;
++	FILE *trace = nullptr;
++	FILE *events = nullptr;
++	KJFSCall kjfsCalls[MAX_KJFS_CALLS]{};
++	size_t kjfsCallCount = 0;
++	bool kjfsEventsEnabled = false;
++	bool kjfsProbeEnabled = false;
++	bool kjfsProbeStartPending = false;
++	bool kjfsProbeCallPending = false;
++	bool kjfsProbeRunning = false;
++	int kjfsProbeInitialStage = 0;
++	int kjfsProbeStage = 0;
++	int kjfsProbeStopStage = 0;
++	u32 kjfsProbeScratch = 0;
++	u32 kjfsProbeHandle = 0;
++	u32 kjfsProbeCanonicalFileSize = 0;
++	u32 kjfsProbeBuffer = 0;
++	bool kjfsProbeExtraPending = false;
++	int kjfsProbeThread = 0;
++	u32 kjfsProbeExtraEntry = 0;
++	u32 kjfsProbeExtraValue = 0;
++	bool kjfsProbeBlockedEnabled = false;
++	int kjfsProbeBlockedStage = 0;
++	int kjfsProbeBlockedRetryLimit = 0;
++	int kjfsProbeBlockedRetryCount = 0;
++	int kjfsProbeBlockedPhase = 0;
++	int kjfsProbeBlockedThread = 0;
++	u32 kjfsProbeBlockedAsyncResultAddress = 0;
++};
++
++OracleState state;
++
++[[noreturn]] void OracleFatal(const char *message) {
++	std::fprintf(stderr, "PSP recomp oracle: %s\n", message);
++	if (state.trace)
++		std::fclose(state.trace);
++	if (state.events)
++		std::fclose(state.events);
++	std::exit(2);
++}
++
++std::string OutputPath(const char *name) {
++	return state.directory + "/" + name;
++}
++
++u32 ParseHex(const char *value, const char *name) {
++	char *end = nullptr;
++	errno = 0;
++	unsigned long parsed = std::strtoul(value, &end, 16);
++	if (errno || end == value || *end != '\0' || parsed > 0xFFFFFFFFUL) {
++		std::fprintf(stderr, "PSP recomp oracle: invalid %s: %s\n", name, value);
++		std::exit(2);
++	}
++	return (u32)parsed;
++}
++
++unsigned long long ParseSteps(const char *value) {
++	char *end = nullptr;
++	errno = 0;
++	unsigned long long parsed = std::strtoull(value, &end, 10);
++	if (errno || end == value || *end != '\0' || parsed == 0 || parsed > MAX_TRACE_STEPS) {
++		std::fprintf(stderr, "PSP recomp oracle: invalid step limit: %s\n", value);
++		std::exit(2);
++	}
++	return parsed;
++}
++
++void Configure() {
++	if (state.configured)
++		return;
++	state.configured = true;
++	const char *directory = std::getenv("PSPRECOMP_ORACLE_DIR");
++	if (!directory || !directory[0])
++		return;
++	const char *startPC = std::getenv("PSPRECOMP_ORACLE_START_PC");
++	const char *steps = std::getenv("PSPRECOMP_ORACLE_STEPS");
++	const char *target = std::getenv("PSPRECOMP_ORACLE_TARGET");
++	if (!startPC || !steps || !target || !target[0])
++		OracleFatal("DIR requires START_PC, STEPS, and TARGET");
++	state.startPC = ParseHex(startPC, "start PC");
++	if ((state.startPC & 3) != 0)
++		OracleFatal("start PC must be four-byte aligned");
++	state.limit = ParseSteps(steps);
++	state.directory = directory;
++	state.target = target;
++	const char *kjfsProbe = std::getenv("PSPRECOMP_ORACLE_KJFS_PROBE");
++	if (kjfsProbe && std::strcmp(kjfsProbe, "1") != 0)
++		OracleFatal("PSPRECOMP_ORACLE_KJFS_PROBE must be 1 when set");
++	state.kjfsProbeEnabled = kjfsProbe != nullptr;
++	const char *kjfsEvents = std::getenv("PSPRECOMP_ORACLE_KJFS_EVENTS");
++	if (kjfsEvents && std::strcmp(kjfsEvents, "1") != 0)
++		OracleFatal("PSPRECOMP_ORACLE_KJFS_EVENTS must be 1 when set");
++	state.kjfsEventsEnabled = state.kjfsProbeEnabled || kjfsEvents != nullptr;
++	const char *eventsOnly = std::getenv("PSPRECOMP_ORACLE_EVENTS_ONLY");
++	if (eventsOnly && std::strcmp(eventsOnly, "1") != 0)
++		OracleFatal("PSPRECOMP_ORACLE_EVENTS_ONLY must be 1 when set");
++	state.eventsOnly = eventsOnly != nullptr;
++	if (state.eventsOnly && !state.kjfsEventsEnabled)
++		OracleFatal("events-only capture requires KJFS events");
++	state.enabled = true;
++}
++
++void WriteJSONString(FILE *stream, const char *value) {
++	std::fputc('"', stream);
++	for (const unsigned char *p = (const unsigned char *)value; *p; ++p) {
++		switch (*p) {
++		case '"':
++			std::fputs("\\\"", stream);
++			break;
++		case '\\':
++			std::fputs("\\\\", stream);
++			break;
++		case '\b':
++			std::fputs("\\b", stream);
++			break;
++		case '\f':
++			std::fputs("\\f", stream);
++			break;
++		case '\n':
++			std::fputs("\\n", stream);
++			break;
++		case '\r':
++			std::fputs("\\r", stream);
++			break;
++		case '\t':
++			std::fputs("\\t", stream);
++			break;
++		default:
++			if (*p < 0x20)
++				std::fprintf(stream, "\\u%04x", *p);
++			else
++				std::fputc(*p, stream);
++			break;
++		}
++	}
++	std::fputc('"', stream);
++}
++
++void WriteHexBytes(FILE *stream, u32 address, u32 size) {
++	for (u32 i = 0; i < size; ++i)
++		std::fprintf(stream, "%02x", Memory::Read_U8(address + i));
++}
++
++struct BlockJSONContext {
++	FILE *stream;
++	bool first = true;
++};
++
++void WriteBlockJSON(
++	u32 start,
++	u32 size,
++	bool taken,
++	const char *tag,
++	void *userdata) {
++	BlockJSONContext *context = (BlockJSONContext *)userdata;
++	if (!context->first)
++		std::fputc(',', context->stream);
++	std::fputs("\n      {\"start\":", context->stream);
++	std::fprintf(
++		context->stream,
++		"%u,\"size\":%u,\"taken\":%s,\"tag\":",
++		start,
++		size,
++		taken ? "true" : "false");
++	WriteJSONString(context->stream, tag ? tag : "");
++	std::fputc('}', context->stream);
++	context->first = false;
++}
++
++void WriteBlockList(FILE *stream, const BlockAllocator &allocator) {
++	BlockJSONContext context{stream};
++	allocator.IterateBlocks(WriteBlockJSON, &context);
++	if (!context.first)
++		std::fputc('\n', stream);
++}
++
++PSPThread *CurrentThread() {
++	u32 error = 0;
++	return kernelObjects.Get<PSPThread>(__KernelGetCurThread(), error);
++}
++
++void WriteStack(const PSPThread *thread) {
++	const u32 start = thread->currentStack.start;
++	const u32 size = thread->currentStack.end - start;
++	const u8 *data = Memory::GetPointerRange(start, size);
++	if (!data)
++		OracleFatal("current thread stack is not readable");
++	const std::string path = OutputPath("stack.bin");
++	FILE *stream = std::fopen(path.c_str(), "wb");
++	if (!stream)
++		OracleFatal("cannot create stack.bin");
++	if (std::fwrite(data, 1, size, stream) != size || std::fclose(stream) != 0)
++		OracleFatal("cannot write stack.bin");
++}
++
++void WriteThreadJSON(FILE *stream, SceUID uid, const PSPThread *thread) {
++	std::fputs("{\"uid\":", stream);
++	std::fprintf(stream, "%d,\"name\":", uid);
++	WriteJSONString(stream, thread->nt.name);
++	std::fprintf(
++		stream,
++		",\"entry\":%u,\"module_uid\":%d,\"attr\":%u,\"status\":%u,"
++		"\"initial_priority\":%d,\"current_priority\":%d,"
++		"\"stack_start\":%u,\"stack_size\":%u,\"gp\":%u}",
++		(u32)thread->nt.entrypoint,
++		thread->moduleId,
++		(u32)thread->nt.attr,
++		(u32)thread->nt.status,
++		(s32)thread->nt.initialPriority,
++		(s32)thread->nt.currentPriority,
++		thread->currentStack.start,
++		thread->currentStack.end - thread->currentStack.start,
++		(u32)thread->nt.gpreg);
++}
++
++void WriteModuleJSON(FILE *stream, SceUID uid, const PSPModule *module) {
++	char name[sizeof(module->nm.name) + 1]{};
++	std::memcpy(name, module->nm.name, sizeof(module->nm.name));
++	std::fputs("{\"uid\":", stream);
++	std::fprintf(stream, "%d,\"name\":", uid);
++	WriteJSONString(stream, name);
++	std::fprintf(
++		stream,
++		",\"status\":%u,\"attr\":%u,\"entry\":%u,\"gp\":%u,"
++		"\"text_addr\":%u,\"text_size\":%u,\"data_size\":%u,"
++		"\"bss_size\":%u,\"memory_block_addr\":%u,"
++		"\"memory_block_size\":%u,\"module_struct_addr\":%u,"
++		"\"start_priority\":%u,\"start_stack_size\":%u,"
++		"\"start_attr\":%u}",
++		(u32)module->nm.status,
++		(u32)module->nm.attribute,
++		(u32)module->nm.entry_addr,
++		(u32)module->nm.gp_value,
++		(u32)module->nm.text_addr,
++		(u32)module->nm.text_size,
++		(u32)module->nm.data_size,
++		(u32)module->nm.bss_size,
++		module->memoryBlockAddr,
++		module->memoryBlockSize,
++		module->modulePtr.ptr,
++		(u32)module->nm.module_start_thread_priority,
++		(u32)module->nm.module_start_thread_stacksize,
++		(u32)module->nm.module_start_thread_attr);
++}
++
++void WriteBootState(MIPSState *mips) {
++	PSPThread *thread = CurrentThread();
++	if (!thread)
++		OracleFatal("no current PSP thread at trace entry");
++	const u32 argLength = mips->r[MIPS_REG_A0];
++	const u32 argAddress = mips->r[MIPS_REG_A1];
++	if (argLength > 1024 * 1024)
++		OracleFatal("module argument exceeds one MiB");
++	if (argLength && !Memory::IsValidRange(argAddress, argLength))
++		OracleFatal("module argument range is invalid");
++
++	WriteStack(thread);
++	const std::string path = OutputPath("boot_state.json");
++	FILE *stream = std::fopen(path.c_str(), "wb");
++	if (!stream)
++		OracleFatal("cannot create boot_state.json");
++	std::fprintf(
++		stream,
++		"{\n  \"schema\": 1,\n  \"entry_pc\": %u,\n"
++		"  \"gp\": %u,\n  \"sp\": %u,\n  \"hi\": %u,\n"
++		"  \"lo\": %u,\n  \"fcr31\": %u,\n  \"fpcond\": %u,\n",
++		mips->pc,
++		mips->r[MIPS_REG_GP],
++		mips->r[MIPS_REG_SP],
++		mips->hi,
++		mips->lo,
++		mips->fcr31,
++		mips->fpcond);
++	std::fputs("  \"gpr\": [", stream);
++	for (int i = 0; i < 32; ++i)
++		std::fprintf(stream, "%s%u", i ? ", " : "", mips->r[i]);
++	std::fputs("],\n  \"fpr_bits\": [", stream);
++	for (int i = 0; i < 32; ++i)
++		std::fprintf(stream, "%s%u", i ? ", " : "", mips->fi[i]);
++	std::fputs("],\n  \"vfpu_bits\": [", stream);
++	for (int i = 0; i < 128; ++i)
++		std::fprintf(stream, "%s%u", i ? ", " : "", mips->vi[i]);
++	std::fputs("],\n  \"vfpu_control\": [", stream);
++	for (int i = 0; i < 16; ++i)
++		std::fprintf(stream, "%s%u", i ? ", " : "", mips->vfpuCtrl[i]);
++	std::fprintf(
++		stream,
++		"],\n  \"next_uid\": %d,\n  \"initial_ge_list_id\": %d,\n"
++		"  \"ram_size\": %u,\n  \"memory_pools\": {\n"
++		"    \"kernel\": [",
++		kernelObjects.GetNextUID(),
++		gpu ? gpu->GetNextListID() : 0,
++		Memory::g_MemorySize);
++	WriteBlockList(stream, kernelMemory);
++	std::fputs("    ],\n    \"user\": [", stream);
++	WriteBlockList(stream, userMemory);
++	std::fputs("    ],\n    \"volatile\": [", stream);
++	BlockAllocator *volatileMemory = BlockAllocatorFromID(5);
++	if (!volatileMemory)
++		OracleFatal("volatile memory allocator is unavailable");
++	WriteBlockList(stream, *volatileMemory);
++	std::fprintf(
++		stream,
++		"    ]\n  },\n  \"argument\": {\"length\": %u,"
++		" \"address\": %u, \"hex\": \"",
++		argLength,
++		argAddress);
++	WriteHexBytes(stream, argAddress, argLength);
++	std::fputs("\"},\n  \"current_thread\": ", stream);
++	WriteThreadJSON(stream, thread->GetUID(), thread);
++	std::fputs(",\n  \"modules\": [", stream);
++	bool first = true;
++	kernelObjects.Iterate<PSPModule>(
++		[&](SceUID uid, PSPModule *item) {
++			if (!first)
++				std::fputs(",", stream);
++			std::fputs("\n    ", stream);
++			WriteModuleJSON(stream, uid, item);
++			first = false;
++			return true;
++		});
++	std::fputs("\n  ],\n  \"threads\": [", stream);
++	first = true;
++	kernelObjects.Iterate<PSPThread>(
++		[&](SceUID uid, PSPThread *item) {
++			if (!first)
++				std::fputs(",", stream);
++			std::fputs("\n    ", stream);
++			WriteThreadJSON(stream, uid, item);
++			first = false;
++			return true;
++		});
++	std::fputs("\n  ],\n  \"stack_file\": \"stack.bin\"\n}\n", stream);
++	if (std::fclose(stream) != 0)
++		OracleFatal("cannot close boot_state.json");
++}
++
++void OpenTrace(MIPSState *mips) {
++	const std::string tracePath = OutputPath("cpu.trace");
++	const std::string eventsPath = OutputPath("events.jsonl");
++	state.trace = std::fopen(tracePath.c_str(), "wb");
++	state.events = std::fopen(eventsPath.c_str(), "wb");
++	if (!state.trace || !state.events)
++		OracleFatal("cannot create trace output files");
++	std::fprintf(
++		state.trace,
++		"# psp-recomp trace v1 target=%s oracle=ppsspp "
++		"start_pc=0x%08x steps=%llu\n",
++		state.target.c_str(),
++		state.startPC,
++		state.limit);
++	std::fprintf(
++		state.trace,
++		"# kernel next_uid=0x%x\n",
++		kernelObjects.GetNextUID());
++	std::fprintf(
++		state.trace,
++		"# ge next_list_id=%d\n",
++		gpu ? gpu->GetNextListID() : 0);
++	std::fprintf(state.trace, "# init pc=0x%08x", mips->pc);
++	for (int i = 1; i < 32; ++i)
++		std::fprintf(state.trace, " r%d=0x%08x", i, mips->r[i]);
++	std::fprintf(
++		state.trace,
++		" hi=0x%08x lo=0x%08x fcr31=0x%08x fpcond=0x%08x\n",
++		mips->hi,
++		mips->lo,
++		mips->fcr31,
++		mips->fpcond);
++	WriteBootState(mips);
++	std::fprintf(
++		state.events,
++		"{\"event\":\"trace_start\",\"step\":0,\"thread\":%d,"
++		"\"pc\":%u}\n",
++		__KernelGetCurThread(),
++		mips->pc);
++	std::fprintf(
++		stderr,
++		"PSP recomp oracle: started at 0x%08x for %llu steps\n",
++		mips->pc,
++		state.limit);
++}
++
++void Snapshot(MIPSState *mips, u32 pc, u32 op) {
++	std::memcpy(state.r, mips->r, sizeof(state.r));
++	std::memcpy(state.fi, mips->fi, sizeof(state.fi));
++	std::memcpy(state.vi, mips->vi, sizeof(state.vi));
++	state.hi = mips->hi;
++	state.lo = mips->lo;
++	state.fcr31 = mips->fcr31;
++	state.pc = pc;
++	state.op = op;
++	state.memAddress = 0;
++	state.memSize = 0;
++
++	const MIPSOpcode opcode(op);
++	const MIPSInfo info = MIPSGetInfo(opcode);
++	if ((info & OUT_MEM) != 0) {
++		const int rs = (op >> 21) & 0x1F;
++		const s32 offset = (info & IS_VFPU) != 0
++			? (s16)(op & 0xFFFC)
++			: (s16)(op & 0xFFFF);
++		state.memAddress = mips->r[rs] + offset;
++		state.memSize = MIPSGetMemoryAccessSize(opcode);
++		const u32 primary = op >> 26;
++		if (primary == 42 || primary == 46)
++			state.memAddress &= ~3u;
++	}
++}
++
++void WriteStep(MIPSState *mips) {
++	std::fprintf(
++		state.trace,
++		"%llu pc=0x%08x op=0x%08x",
++		state.step,
++		state.pc,
++		state.op);
++	for (int i = 1; i < 32; ++i) {
++		if (mips->r[i] != state.r[i])
++			std::fprintf(state.trace, " r%d=0x%08x", i, mips->r[i]);
++	}
++	if (mips->hi != state.hi)
++		std::fprintf(state.trace, " hi=0x%08x", mips->hi);
++	if (mips->lo != state.lo)
++		std::fprintf(state.trace, " lo=0x%08x", mips->lo);
++	for (int i = 0; i < 32; ++i) {
++		if (mips->fi[i] != state.fi[i])
++			std::fprintf(state.trace, " f%d=0x%08x", i, mips->fi[i]);
++	}
++	if (mips->fcr31 != state.fcr31)
++		std::fprintf(state.trace, " fcr31=0x%08x", mips->fcr31);
++	for (int i = 0; i < 128; ++i) {
++		if (mips->vi[i] != state.vi[i])
++			std::fprintf(state.trace, " v%d=0x%08x", i, mips->vi[i]);
++	}
++	if (state.memSize == 1) {
++		std::fprintf(
++			state.trace,
++			" m8[0x%08x]=0x%02x",
++			state.memAddress,
++			Memory::Read_U8(state.memAddress));
++	} else if (state.memSize == 2) {
++		std::fprintf(
++			state.trace,
++			" m16[0x%08x]=0x%04x",
++			state.memAddress,
++			Memory::Read_U16(state.memAddress));
++	} else if (state.memSize == 4) {
++		std::fprintf(
++			state.trace,
++			" m32[0x%08x]=0x%08x",
++			state.memAddress,
++			Memory::Read_U32(state.memAddress));
++	} else if (state.memSize == 8 || state.memSize == 16) {
++		for (int offset = 0; offset < state.memSize; offset += 4) {
++			std::fprintf(
++				state.trace,
++				" m32[0x%08x]=0x%08x",
++				state.memAddress + offset,
++				Memory::Read_U32(state.memAddress + offset));
++		}
++	}
++	std::fputc('\n', state.trace);
++}
++
++void Complete() {
++	const std::string donePath = OutputPath("trace.done");
++	if (std::fflush(state.trace) != 0 || std::fclose(state.trace) != 0)
++		OracleFatal("cannot finalize cpu.trace");
++	state.trace = nullptr;
++	if (std::fflush(state.events) != 0 || std::fclose(state.events) != 0)
++		OracleFatal("cannot finalize events.jsonl");
++	state.events = nullptr;
++	FILE *done = std::fopen(donePath.c_str(), "wb");
++	if (!done || std::fprintf(done, "%llu\n", state.limit) < 0 || std::fclose(done) != 0)
++		OracleFatal("cannot write trace.done");
++	std::fprintf(
++		stderr,
++		"PSP recomp oracle: completed %llu steps\n",
++		state.limit);
++	Core_Stop();
++}
++
++u32 KJFSNID(u32 pc) {
++	switch (pc) {
++	case 0x08B758A4: return 0x2FCD7551;
++	case 0x08B758EC: return 0xC78E5271;
++	case 0x08B762D8: return 0x93E9297F;
++	case 0x08B76338: return 0x1ECF095D;
++	case 0x08B764E0: return 0x18B0F227;
++	case 0x08B76664: return 0x5646F8BB;
++	case 0x08B766B0: return 0x65BD27F9;
++	case 0x08B76778: return 0x432F631B;
++	case 0x08B76930: return 0x833DE7FC;
++	case 0x08B76ACC: return 0x276EA32C;
++	case 0x08B76B30: return 0x11EC897F;
++	case 0x08B76C18: return 0x2B9B31B4;
++	case 0x08B76E0C: return 0xA988714B;
++	case 0x08B7710C: return 0xB6D85698;
++	case 0x08B77678: return 0x813E06AD;
++	case 0x08B776F4: return 0x793A5E87;
++	case 0x08B77784: return 0xB17334D0;
++	case 0x08B777A0: return 0xE870999F;
++	case 0x08B77900: return 0x1B969771;
++	case 0x08B779C4: return 0xC5183ABB;
++	default: return 0;
++	}
++}
++
++bool KJFSIdentityActive() {
++	bool found = false;
++	kernelObjects.Iterate<PSPModule>(
++		[&](SceUID, PSPModule *module) {
++			if (std::strcmp(module->GetName(), "KCEJ_FS") == 0 &&
++				module->memoryBlockAddr == 0x08B75500 &&
++				module->memoryBlockSize == 0x11A00)
++				found = true;
++			return !found;
++		});
++	return found;
++}
++
++void WriteKJFSPointerEvidence(FILE *stream, int argument, u32 address) {
++	if (!Memory::IsValidRange(address, 64))
++		return;
++	const u8 *data = Memory::GetPointerRange(address, 64);
++	std::fprintf(stream, ",\"arg%d_hex\":\"", argument);
++	for (int index = 0; index < 64; ++index)
++		std::fprintf(stream, "%02x", data[index]);
++	std::fputc('"', stream);
++
++	std::string text;
++	for (int index = 0; index < 256; ++index) {
++		u32 current = address + index;
++		if (!Memory::IsValidAddress(current)) {
++			text.clear();
++			break;
++		}
++		u8 value = *Memory::GetPointerUnchecked(current);
++		if (!value) {
++			if (!text.empty()) {
++				std::fprintf(stream, ",\"arg%d_text\":", argument);
++				WriteJSONString(stream, text.c_str());
++			}
++			break;
++		}
++		if (value < 0x20 || value > 0x7E) {
++			text.clear();
++			break;
++		}
++		text.push_back((char)value);
++	}
++}
++
++void WriteKJFSEvidence(
++	const char *event,
++	const MIPSState *mips,
++	const KJFSCall &call,
++	u32 pc) {
++	std::fprintf(
++		state.events,
++		"{\"event\":\"%s\",\"step\":%llu,\"thread\":%d,\"nid\":%u,"
++		"\"pc\":%u,\"return_pc\":%u,\"args\":[%u,%u,%u,%u]",
++		event,
++		state.step,
++		call.thread,
++		call.nid,
++		pc,
++		call.returnPC,
++		call.args[0],
++		call.args[1],
++		call.args[2],
++		call.args[3]);
++	if (std::strcmp(event, "kjfs_return") == 0) {
++		std::fprintf(
++			state.events,
++			",\"result\":%u,\"result_hi\":%u",
++			mips->r[MIPS_REG_V0],
++			mips->r[MIPS_REG_V1]);
++	} else {
++		u32 sp = mips->r[MIPS_REG_SP];
++		if (Memory::IsValidRange(sp + 16, 32)) {
++			std::fputs(",\"stack\":[", state.events);
++			for (int index = 0; index < 8; ++index) {
++				if (index)
++					std::fputc(',', state.events);
++				std::fprintf(
++					state.events,
++					"%u",
++					Memory::Read_U32(sp + 16 + index * 4));
++			}
++			std::fputc(']', state.events);
++		}
++	}
++	for (int index = 0; index < 4; ++index)
++		WriteKJFSPointerEvidence(state.events, index, call.args[index]);
++	std::fputs("}\n", state.events);
++}
++
++static const char *KJFS_PROBE_LABELS[] = {
++	"open_archive_canonical",
++	"size_archive",
++	"read_archive_request_8",
++	"close_archive",
++	"open_direct",
++	"size_direct",
++	"seek_direct_start_0",
++	"read_direct_prefix_8",
++	"seek_direct_start_10",
++	"read_direct_middle_4",
++	"seek_direct_end_minus_4",
++	"read_direct_past_eof_8",
++	"read_direct_at_eof_4",
++	"seek_direct_beyond_eof_49",
++	"read_direct_beyond_eof_4",
++	"seek_direct_current_plus_2",
++	"close_direct",
++	"size_closed_handle",
++	"read_invalid_handle",
++	"close_invalid_handle",
++	"open_device_case",
++	"close_device_case",
++	"open_backslashes",
++	"close_backslashes",
++	"open_component_case",
++	"close_component_case",
++	"open_dot_components",
++	"close_dot_components",
++	"open_double_slash",
++	"close_double_slash",
++	"open_missing",
++	"open_mode_0",
++	"close_mode_0",
++	"open_mode_2",
++	"close_mode_2",
++	"open_archive_for_null_buffer",
++	"read_null_buffer",
++	"close_after_null_buffer",
++	"open_archive_for_repeat_reads",
++	"read_archive_zero",
++	"read_archive_64",
++	"close_after_repeat_reads",
++	"open_direct_for_negative_seek",
++	"seek_direct_negative_start",
++	"close_after_negative_seek",
++	"seek_invalid_handle",
++	"open_direct_for_invalid_whence",
++	"seek_direct_invalid_whence",
++	"open_direct_component_case",
++	"close_direct_component_case",
++	"open_direct_dot_component",
++	"close_direct_dot_component",
++	"open_direct_double_slash",
++	"close_direct_double_slash",
++	"open_canonical_file",
++	"size_canonical_file",
++	"read_canonical_file_full",
++	"close_canonical_file",
++};
++
++constexpr int KJFS_PROBE_STAGE_COUNT =
++	sizeof(KJFS_PROBE_LABELS) / sizeof(KJFS_PROBE_LABELS[0]);
++
++struct KJFSBlockedSpec {
++	int stage;
++	const char *operationName;
++	u32 operationNID;
++	u32 operationPC;
++	u32 operationResult;
++	const char *waitName;
++	u32 waitNID;
++	u32 waitPC;
++	u32 waitResult;
++	u32 asyncResultLow;
++	u32 asyncResultHigh;
++	u32 delayPC;
++};
++
++static const KJFSBlockedSpec KJFS_BLOCKED_SPECS[] = {
++	{
++		20, "sceIoOpen", 0x109F50BC, 0x08B761B8, 0x80010002,
++		nullptr, 0, 0, 0, 0, 0, 0x08B761DC,
++	},
++	{
++		28, "sceIoOpen", 0x109F50BC, 0x08B761B8, 0x80010002,
++		nullptr, 0, 0, 0, 0, 0, 0x08B761DC,
++	},
++	{
++		31, "sceIoRead", 0x6A638D83, 0x08B77CB0, 0x80020323,
++		nullptr, 0, 0, 0, 0, 0, 0x08B77CC4,
++	},
++	{
++		43, "sceIoLseekAsync", 0x71B19E77, 0x08B763C4, 0,
++		"sceIoWaitAsyncCB", 0x35DBD746, 0x08B763D4, 0,
++		0xFFFFFFFF, 0xFFFFFFFF, 0x08B76414,
++	},
++	{
++		45, "sceIoLseekAsync", 0x71B19E77, 0x08B763C4, 0x80020323,
++		nullptr, 0, 0, 0, 0, 0, 0x08B76414,
++	},
++};
++
++const KJFSBlockedSpec *KJFSBlockedSpecForStage(int stage) {
++	for (const KJFSBlockedSpec &spec : KJFS_BLOCKED_SPECS) {
++		if (spec.stage == stage)
++			return &spec;
++	}
++	return nullptr;
++}
++
++int ParseKJFSProbeStage(const char *name, int defaultValue, int maximum) {
++	const char *text = std::getenv(name);
++	if (!text || !text[0])
++		return defaultValue;
++	char *end = nullptr;
++	errno = 0;
++	long value = std::strtol(text, &end, 10);
++	if (errno || end == text || *end || value < 0 || value > maximum) {
++		std::fprintf(stderr, "PSP recomp oracle: invalid %s: %s\n", name, text);
++		std::exit(2);
++	}
++	return (int)value;
++}
++
++bool KJFSProbeStageOpensHandle(int stage) {
++	switch (stage) {
++	case 0:
++	case 4:
++	case 20:
++	case 22:
++	case 24:
++	case 26:
++	case 28:
++	case 31:
++	case 33:
++	case 35:
++	case 38:
++	case 42:
++	case 46:
++	case 48:
++	case 50:
++	case 52:
++	case 54:
++		return true;
++	default:
++		return false;
++	}
++}
++
++void WriteKJFSProbeBuffer(FILE *stream, u32 address) {
++	if (!address)
++		return;
++	if (address < 16 || !Memory::IsValidRange(address - 16, 96))
++		OracleFatal("KJFS probe buffer guard is outside guest memory");
++	const u8 *data = Memory::GetPointerRange(address, 64);
++	std::fputs(",\"buffer_hex\":\"", stream);
++	for (int index = 0; index < 64; ++index)
++		std::fprintf(stream, "%02x", data[index]);
++	std::fputc('"', stream);
++	const u8 *before = Memory::GetPointerRange(address - 16, 16);
++	const u8 *after = Memory::GetPointerRange(address + 64, 16);
++	std::fputs(",\"guard_before_hex\":\"", stream);
++	for (int index = 0; index < 16; ++index)
++		std::fprintf(stream, "%02x", before[index]);
++	std::fputs("\",\"guard_after_hex\":\"", stream);
++	for (int index = 0; index < 16; ++index)
++		std::fprintf(stream, "%02x", after[index]);
++	std::fputc('"', stream);
++}
++
++void WriteKJFSProbePath(FILE *stream, u32 address) {
++	if (!Memory::IsValidRange(address, 256))
++		OracleFatal("KJFS probe path is outside guest memory");
++	const u8 *path = Memory::GetPointerRange(address, 256);
++	const u8 *end = static_cast<const u8 *>(std::memchr(path, 0, 256));
++	if (!end)
++		OracleFatal("KJFS probe path is not terminated");
++	std::fputs(",\"path_hex\":\"", stream);
++	for (const u8 *cursor = path; cursor < end; ++cursor)
++		std::fprintf(stream, "%02x", *cursor);
++	std::fputc('"', stream);
++}
++
++class KJFSProbeAction : public PSPAction {
++public:
++	explicit KJFSProbeAction(int stage) : stage_(stage) {
++		actionTypeID = -1;
++	}
++
++	void run(MipsCall &) override {
++		if (state.kjfsProbeBlockedEnabled &&
++			stage_ == state.kjfsProbeBlockedStage) {
++			OracleFatal("KJFS blocked probe call unexpectedly returned");
++		}
++		u32 result = currentMIPS->r[MIPS_REG_V0];
++		u32 resultHi = currentMIPS->r[MIPS_REG_V1];
++		std::fprintf(
++			state.events,
++			"{\"event\":\"kjfs_probe_case\",\"phase\":\"return\","
++			"\"stage\":%d,\"case\":",
++			stage_);
++		WriteJSONString(state.events, KJFS_PROBE_LABELS[stage_]);
++		std::fprintf(
++			state.events,
++			",\"result\":%u,\"result_hi\":%u",
++			result,
++			resultHi);
++		WriteKJFSProbeBuffer(state.events, state.kjfsProbeBuffer);
++		std::fputs("}\n", state.events);
++		if (KJFSProbeStageOpensHandle(stage_))
++			state.kjfsProbeHandle = result;
++		if (stage_ == 55) {
++			if (!result || result > 64)
++				OracleFatal("KJFS probe canonical file size is invalid");
++			state.kjfsProbeCanonicalFileSize = result;
++		}
++		if (state.kjfsProbeExtraPending)
++			OracleFatal("KJFS probe did not verify its fifth argument");
++		state.kjfsProbeStage = stage_ + 1;
++		state.kjfsProbeCallPending = true;
++	}
++
++	void DoState(PointerWrap &) override {
++	}
++
++private:
++	int stage_;
++};
++
++void SetKJFSProbeString(u32 address, const char *text) {
++	Memory::MemcpyUnchecked(address, text, (u32)std::strlen(text) + 1);
++}
++
++void StartKJFSProbe() {
++	state.kjfsProbeStartPending = false;
++	u32 size = 0x10000;
++	u32 scratch = userMemory.Alloc(size, true, "KJFS oracle probe");
++	if (scratch == 0xFFFFFFFF)
++		OracleFatal("cannot allocate KJFS probe memory");
++	state.kjfsProbeScratch = scratch;
++	state.kjfsProbeHandle = 0;
++	state.kjfsProbeCanonicalFileSize = 0;
++	state.kjfsProbeStage = ParseKJFSProbeStage(
++		"PSPRECOMP_ORACLE_KJFS_PROBE_STAGE",
++		0,
++		KJFS_PROBE_STAGE_COUNT - 1);
++	state.kjfsProbeInitialStage = state.kjfsProbeStage;
++	state.kjfsProbeStopStage = ParseKJFSProbeStage(
++		"PSPRECOMP_ORACLE_KJFS_PROBE_STOP",
++		KJFS_PROBE_STAGE_COUNT,
++		KJFS_PROBE_STAGE_COUNT);
++	if (state.kjfsProbeStage >= state.kjfsProbeStopStage)
++		OracleFatal("KJFS probe start stage must precede its stop stage");
++	const char *blockedStage =
++		std::getenv("PSPRECOMP_ORACLE_KJFS_BLOCK_STAGE");
++	const char *blockedRetries =
++		std::getenv("PSPRECOMP_ORACLE_KJFS_BLOCK_RETRIES");
++	if ((blockedStage == nullptr) != (blockedRetries == nullptr))
++		OracleFatal("KJFS blocked probe configuration is incomplete");
++	state.kjfsProbeBlockedEnabled = blockedStage != nullptr;
++	if (state.kjfsProbeBlockedEnabled) {
++		state.kjfsProbeBlockedStage = ParseKJFSProbeStage(
++			"PSPRECOMP_ORACLE_KJFS_BLOCK_STAGE",
++			0,
++			KJFS_PROBE_STAGE_COUNT - 1);
++		state.kjfsProbeBlockedRetryLimit = ParseKJFSProbeStage(
++			"PSPRECOMP_ORACLE_KJFS_BLOCK_RETRIES",
++			0,
++			64);
++		const KJFSBlockedSpec *spec =
++			KJFSBlockedSpecForStage(state.kjfsProbeBlockedStage);
++		const int expectedStart =
++			state.kjfsProbeBlockedStage == 43
++			? 42
++			: state.kjfsProbeBlockedStage;
++		if (!spec || state.kjfsProbeBlockedRetryLimit < 1 ||
++			state.kjfsProbeStage != expectedStart ||
++			state.kjfsProbeStopStage !=
++				state.kjfsProbeBlockedStage + 1) {
++			OracleFatal("KJFS blocked probe range is invalid");
++		}
++	}
++	state.kjfsProbeBlockedRetryCount = 0;
++	state.kjfsProbeBlockedPhase = 0;
++	state.kjfsProbeBlockedThread = 0;
++	state.kjfsProbeBlockedAsyncResultAddress = 0;
++	state.kjfsProbeRunning = true;
++	std::memset(Memory::GetPointerWriteUnchecked(scratch), 0xCC, size);
++	SetKJFSProbeString(
++		scratch + 0x0000,
++		"disc0:/PSP_GAME/USRDIR/stage/init/data.cnf");
++	SetKJFSProbeString(
++		scratch + 0x0100,
++		"DISC0:/PSP_GAME/USRDIR/stage/init/data.cnf");
++	SetKJFSProbeString(
++		scratch + 0x0200,
++		"disc0:\\PSP_GAME\\USRDIR\\stage\\init\\data.cnf");
++	SetKJFSProbeString(
++		scratch + 0x0300,
++		"disc0:/psp_game/usrdir/STAGE/INIT/DATA.CNF");
++	SetKJFSProbeString(
++		scratch + 0x0400,
++		"disc0:/PSP_GAME/USRDIR/stage/./init/../init/data.cnf");
++	SetKJFSProbeString(
++		scratch + 0x0500,
++		"disc0:/PSP_GAME//USRDIR///stage/init/data.cnf");
++	SetKJFSProbeString(
++		scratch + 0x0600,
++		"disc0:/PSP_GAME/USRDIR/stage/init/__mgspo_missing__.bin");
++	SetKJFSProbeString(scratch + 0x0700, "disc0:/UMD_DATA.BIN");
++	SetKJFSProbeString(scratch + 0x0800, "disc0:/umd_data.bin");
++	SetKJFSProbeString(scratch + 0x0900, "disc0:/./UMD_DATA.BIN");
++	SetKJFSProbeString(scratch + 0x0A00, "disc0://UMD_DATA.BIN");
++	std::fprintf(
++		state.events,
++		"{\"event\":\"kjfs_probe_start\",\"step\":%llu,"
++		"\"scratch\":%u,\"start_stage\":%d,\"stop_stage\":%d}\n",
++		state.step,
++		scratch,
++		state.kjfsProbeStage,
++		state.kjfsProbeStopStage);
++	state.kjfsProbeCallPending = true;
++}
++
++void CompleteKJFSProbe() {
++	if (std::fflush(state.trace) != 0 || std::fflush(state.events) != 0)
++		OracleFatal("cannot flush KJFS probe output");
++	FILE *trace = state.trace;
++	state.trace = nullptr;
++	if (std::fclose(trace) != 0)
++		OracleFatal("cannot close KJFS probe trace");
++	FILE *events = state.events;
++	state.events = nullptr;
++	if (std::fclose(events) != 0)
++		OracleFatal("cannot close KJFS probe events");
++
++	const std::string donePath = OutputPath("service.done");
++	FILE *done = std::fopen(donePath.c_str(), "wb");
++	if (!done)
++		OracleFatal("cannot create KJFS probe completion marker");
++	if (std::fprintf(
++			done,
++			"{\"schema\":1,\"steps\":%llu,\"start_stage\":%d,"
++			"\"stop_stage\":%d,\"case_count\":%d}\n",
++			state.step,
++			state.kjfsProbeInitialStage,
++			state.kjfsProbeStopStage,
++			state.kjfsProbeStopStage - state.kjfsProbeInitialStage) < 0 ||
++		std::fclose(done) != 0)
++		OracleFatal("cannot write KJFS probe completion marker");
++	state.active = false;
++	Core_Stop();
++}
++
++void CompleteKJFSBlockedProbe() {
++	const KJFSBlockedSpec *spec =
++		KJFSBlockedSpecForStage(state.kjfsProbeBlockedStage);
++	if (!spec)
++		OracleFatal("KJFS blocked probe specification is unavailable");
++	std::fprintf(
++		state.events,
++		"{\"event\":\"kjfs_probe_blocked\",\"stage\":%d,\"case\":",
++		spec->stage);
++	WriteJSONString(state.events, KJFS_PROBE_LABELS[spec->stage]);
++	std::fprintf(
++		state.events,
++		",\"retry_count\":%d,\"operation\":{\"name\":",
++		state.kjfsProbeBlockedRetryCount);
++	WriteJSONString(state.events, spec->operationName);
++	std::fprintf(
++		state.events,
++		",\"nid\":%u,\"pc\":%u,\"result\":%u}",
++		spec->operationNID,
++		spec->operationPC,
++		spec->operationResult);
++	if (spec->waitName) {
++		std::fputs(",\"wait\":{\"name\":", state.events);
++		WriteJSONString(state.events, spec->waitName);
++		std::fprintf(
++			state.events,
++			",\"nid\":%u,\"pc\":%u,\"result\":%u,"
++			"\"async_result_low\":%u,\"async_result_high\":%u}",
++			spec->waitNID,
++			spec->waitPC,
++			spec->waitResult,
++			spec->asyncResultLow,
++			spec->asyncResultHigh);
++	}
++	std::fprintf(
++		state.events,
++		",\"thread_consistent\":true,"
++		"\"delay\":{\"name\":\"sceKernelDelayThreadCB\","
++		"\"nid\":%u,\"pc\":%u,\"microseconds\":1000000,"
++		"\"result\":0}}\n",
++		0x68DA9E36,
++		spec->delayPC);
++
++	if (std::fflush(state.trace) != 0 || std::fflush(state.events) != 0)
++		OracleFatal("cannot flush KJFS blocked probe output");
++	FILE *trace = state.trace;
++	state.trace = nullptr;
++	if (std::fclose(trace) != 0)
++		OracleFatal("cannot close KJFS blocked probe trace");
++	FILE *events = state.events;
++	state.events = nullptr;
++	if (std::fclose(events) != 0)
++		OracleFatal("cannot close KJFS blocked probe events");
++
++	const std::string donePath = OutputPath("service.blocked");
++	FILE *done = std::fopen(donePath.c_str(), "wb");
++	if (!done)
++		OracleFatal("cannot create KJFS blocked probe marker");
++	bool doneOK = std::fprintf(
++			done,
++			"{\"schema\":1,\"stage\":%d,\"case\":\"%s\","
++			"\"retry_count\":%d}\n",
++			spec->stage,
++			KJFS_PROBE_LABELS[spec->stage],
++			state.kjfsProbeBlockedRetryCount) >= 0;
++	if (std::fclose(done) != 0)
++		doneOK = false;
++	if (!doneOK) {
++		OracleFatal("cannot write KJFS blocked probe marker");
++	}
++	state.kjfsProbeRunning = false;
++	state.active = false;
++	Core_Stop();
++}
++
++void StartKJFSProbeCall() {
++	state.kjfsProbeCallPending = false;
++	int stage = state.kjfsProbeStage;
++	if (stage == state.kjfsProbeStopStage) {
++		std::fprintf(
++			state.events,
++			"{\"event\":\"kjfs_probe_done\",\"step\":%llu}\n",
++			state.step);
++		state.kjfsProbeRunning = false;
++		CompleteKJFSProbe();
++		return;
++	}
++
++	u32 args[6]{};
++	int numArgs = 0;
++	u32 entry = 0;
++	u32 scratch = state.kjfsProbeScratch;
++	u32 handle = state.kjfsProbeHandle;
++	state.kjfsProbeBuffer = 0;
++	switch (stage) {
++	case 0:
++	case 4:
++	case 20:
++	case 22:
++	case 24:
++	case 26:
++	case 28:
++	case 30:
++	case 31:
++	case 33:
++	case 35:
++	case 38:
++	case 42:
++	case 46:
++	case 48:
++	case 50:
++	case 52:
++	case 54: {
++		static const u32 pathOffsets[] = {
++			0x0000, 0x0100, 0x0200, 0x0300, 0x0400, 0x0500, 0x0600,
++		};
++		int pathIndex = 0;
++		if (stage >= 20 && stage <= 30)
++			pathIndex = 1 + (stage - 20) / 2;
++		u32 pathOffset =
++			stage == 54 ? 0 :
++			stage >= 48 ? 0x0800 + (stage - 48) * 0x80 :
++			stage == 4 || stage == 42 || stage == 46
++			? 0x0700 : pathOffsets[pathIndex];
++		args[0] = scratch + pathOffset;
++		args[1] = stage == 31 ? 0 : stage == 33 ? 2 : 1;
++		args[2] = 0;
++		args[3] = scratch + 0x2000;
++		numArgs = 4;
++		entry = 0x08B762D8;
++		break;
++	}
++	case 1:
++	case 5:
++	case 17:
++	case 55:
++		args[0] = handle;
++		numArgs = 1;
++		entry = 0x08B77900;
++		break;
++	case 2:
++	case 7:
++	case 9:
++	case 11:
++	case 12:
++	case 14:
++	case 18:
++	case 36:
++	case 39:
++	case 40:
++	case 56:
++		state.kjfsProbeBuffer = scratch + 0x1000;
++		std::memset(
++			Memory::GetPointerWriteUnchecked(state.kjfsProbeBuffer - 16),
++			0xCC,
++			96);
++		args[0] = stage == 18 ? 0x7FFFFFFF : handle;
++		args[1] = stage == 36 ? 0 : state.kjfsProbeBuffer;
++		if (stage == 36)
++			state.kjfsProbeBuffer = 0;
++		switch (stage) {
++		case 2: args[2] = 8; break;
++		case 7: args[2] = 8; break;
++		case 9: args[2] = 4; break;
++		case 11: args[2] = 8; break;
++		case 12: args[2] = 4; break;
++		case 14: args[2] = 4; break;
++		case 18: args[2] = 4; break;
++		case 36: args[2] = 4; break;
++		case 39: args[2] = 0; break;
++		case 40: args[2] = 64; break;
++		case 56:
++			if (!state.kjfsProbeCanonicalFileSize ||
++				state.kjfsProbeCanonicalFileSize > 64)
++				OracleFatal("KJFS probe canonical file size is unavailable");
++			args[2] = state.kjfsProbeCanonicalFileSize;
++			break;
++		}
++		numArgs = 3;
++		entry = 0x08B76778;
++		break;
++	case 6:
++	case 8:
++	case 10:
++	case 13:
++	case 15:
++	case 43:
++	case 45:
++	case 47:
++		args[0] = stage == 45 ? 0x7FFFFFFF : handle;
++		args[1] = 0;
++		switch (stage) {
++		case 6: args[2] = 0; args[3] = 0; args[4] = 0; break;
++		case 8: args[2] = 10; args[3] = 0; args[4] = 0; break;
++		case 10:
++			args[2] = 0xFFFFFFFC;
++			args[3] = 0xFFFFFFFF;
++			args[4] = 2;
++			break;
++		case 13: args[2] = 49; args[3] = 0; args[4] = 0; break;
++		case 15: args[2] = 2; args[3] = 0; args[4] = 1; break;
++		case 43:
++			args[2] = 0xFFFFFFFF;
++			args[3] = 0xFFFFFFFF;
++			args[4] = 0;
++			break;
++		case 45: args[2] = 0; args[3] = 0; args[4] = 0; break;
++		case 47: args[2] = 0; args[3] = 0; args[4] = 3; break;
++		}
++		numArgs = 5;
++		entry = 0x08B76338;
++		break;
++	case 3:
++	case 16:
++	case 21:
++	case 23:
++	case 25:
++	case 27:
++	case 29:
++	case 32:
++	case 34:
++	case 37:
++	case 41:
++	case 44:
++	case 49:
++	case 51:
++	case 53:
++	case 57:
++		args[0] = handle;
++		numArgs = 1;
++		entry = 0x08B76C18;
++		break;
++	case 19:
++		args[0] = 0x7FFFFFFF;
++		numArgs = 1;
++		entry = 0x08B76C18;
++		break;
++	default:
++		OracleFatal("invalid KJFS probe stage");
++	}
++
++	std::fprintf(
++		state.events,
++		"{\"event\":\"kjfs_probe_case\",\"phase\":\"call\","
++		"\"stage\":%d,\"case\":",
++		stage);
++	WriteJSONString(state.events, KJFS_PROBE_LABELS[stage]);
++	std::fputs(",\"args\":[", state.events);
++	for (int index = 0; index < numArgs; ++index) {
++		if (index)
++			std::fputc(',', state.events);
++		std::fprintf(state.events, "%u", args[index]);
++	}
++	std::fputc(']', state.events);
++	if (entry == 0x08B762D8)
++		WriteKJFSProbePath(state.events, args[0]);
++	std::fputs("}\n", state.events);
++	if (numArgs > 4) {
++		state.kjfsProbeExtraPending = true;
++		state.kjfsProbeThread = __KernelGetCurThread();
++		state.kjfsProbeExtraEntry = entry;
++		state.kjfsProbeExtraValue = args[4];
++	}
++	__KernelDirectMipsCall(
++		entry,
++		new KJFSProbeAction(stage),
++		args,
++		numArgs,
++		false);
++}
++
++void ObserveKJFS(MIPSState *mips, u32 pc) {
++	int thread = __KernelGetCurThread();
++	for (size_t index = state.kjfsCallCount; index > 0; --index) {
++		KJFSCall &call = state.kjfsCalls[index - 1];
++		if (call.thread == thread && call.returnPC == pc) {
++			WriteKJFSEvidence("kjfs_return", mips, call, pc);
++			if (state.kjfsProbeEnabled &&
++				call.nid == 0xC5183ABB &&
++				!state.kjfsProbeRunning) {
++				state.kjfsProbeStartPending = true;
++			}
++			for (size_t move = index; move < state.kjfsCallCount; ++move)
++				state.kjfsCalls[move - 1] = state.kjfsCalls[move];
++			--state.kjfsCallCount;
++			break;
++		}
++	}
++
++	u32 nid = KJFSNID(pc);
++	if (!nid || !KJFSIdentityActive())
++		return;
++	if (state.kjfsProbeExtraPending &&
++		pc == state.kjfsProbeExtraEntry &&
++		thread == state.kjfsProbeThread &&
++		mips->r[MIPS_REG_RA] == 0x08000018) {
++		if (mips->r[MIPS_REG_T0] != state.kjfsProbeExtraValue)
++			OracleFatal("KJFS probe fifth argument is not in t0");
++		state.kjfsProbeExtraPending = false;
++	}
++	if (state.kjfsCallCount == MAX_KJFS_CALLS)
++		OracleFatal("KJFS call stack overflow");
++	KJFSCall &call = state.kjfsCalls[state.kjfsCallCount++];
++	call.thread = thread;
++	call.nid = nid;
++	call.returnPC = mips->r[MIPS_REG_RA];
++	for (int index = 0; index < 4; ++index)
++		call.args[index] = mips->r[MIPS_REG_A0 + index];
++	WriteKJFSEvidence("kjfs_call", mips, call, pc);
++}
++
++void ObserveKJFSBlockedSyscallReturn(
++	const char *name,
++	u32 nid,
++	u32 pc,
++	int thread,
++	const u32 arguments[4],
++	u32 result) {
++	if (!state.active ||
++		!state.kjfsProbeRunning ||
++		!state.kjfsProbeBlockedEnabled ||
++		state.kjfsProbeStage != state.kjfsProbeBlockedStage) {
++		return;
++	}
++	const KJFSBlockedSpec *spec =
++		KJFSBlockedSpecForStage(state.kjfsProbeBlockedStage);
++	if (!spec)
++		OracleFatal("KJFS blocked probe specification is unavailable");
++
++	if (nid == spec->operationNID && pc == spec->operationPC) {
++		if (state.kjfsProbeBlockedPhase != 0)
++			OracleFatal("KJFS blocked operation repeated out of order");
++		if (!name || std::strcmp(name, spec->operationName) != 0 ||
++			result != spec->operationResult) {
++			OracleFatal("KJFS blocked operation result mismatch");
++		}
++		if (!state.kjfsProbeBlockedThread)
++			state.kjfsProbeBlockedThread = thread;
++		if (thread != state.kjfsProbeBlockedThread)
++			OracleFatal("KJFS blocked operation changed threads");
++		state.kjfsProbeBlockedPhase = spec->waitName ? 1 : 2;
++		return;
++	}
++
++	if (spec->waitName && nid == spec->waitNID && pc == spec->waitPC) {
++		if (state.kjfsProbeBlockedPhase != 1 ||
++			thread != state.kjfsProbeBlockedThread ||
++			!name || std::strcmp(name, spec->waitName) != 0 ||
++			result != spec->waitResult) {
++			OracleFatal("KJFS blocked wait result mismatch");
++		}
++		const u32 address = arguments[1];
++		if (!Memory::IsValidRange(address, 8))
++			OracleFatal("KJFS blocked wait async result address is invalid");
++		state.kjfsProbeBlockedAsyncResultAddress = address;
++		state.kjfsProbeBlockedPhase = 2;
++		return;
++	}
++
++	if (nid == 0x68DA9E36 && pc == spec->delayPC) {
++		if (state.kjfsProbeBlockedPhase != 2 ||
++			thread != state.kjfsProbeBlockedThread ||
++			!name || std::strcmp(name, "sceKernelDelayThreadCB") != 0 ||
++			arguments[0] != 1000000 ||
++			result != 0) {
++			OracleFatal("KJFS blocked delay result mismatch");
++		}
++		if (spec->waitName) {
++			const u32 address =
++				state.kjfsProbeBlockedAsyncResultAddress;
++			if (!Memory::IsValidRange(address, 8) ||
++				Memory::Read_U32(address) != spec->asyncResultLow ||
++				Memory::Read_U32(address + 4) !=
++					spec->asyncResultHigh) {
++				OracleFatal("KJFS blocked wait async result mismatch");
++			}
++			state.kjfsProbeBlockedAsyncResultAddress = 0;
++		}
++		state.kjfsProbeBlockedPhase = 0;
++		++state.kjfsProbeBlockedRetryCount;
++		if (state.kjfsProbeBlockedRetryCount ==
++			state.kjfsProbeBlockedRetryLimit) {
++			CompleteKJFSBlockedProbe();
++		}
++	}
++}
++
++}  // namespace
++
++void PSPRecompOracleBeginStep(MIPSState *mips, u32 pc, u32 op) {
++	Configure();
++	state.stepActive = false;
++	if (!state.enabled)
++		return;
++	if (!state.active) {
++		if (pc != state.startPC)
++			return;
++		state.active = true;
++		OpenTrace(mips);
++	}
++	if (state.kjfsEventsEnabled)
++		ObserveKJFS(mips, pc);
++	if (state.eventsOnly) {
++		state.pc = pc;
++		state.op = op;
++		state.memAddress = 0;
++		state.memSize = 0;
++	} else {
++		Snapshot(mips, pc, op);
++	}
++	state.stepActive = true;
++}
++
++void PSPRecompOracleEndStep(MIPSState *mips) {
++	if (!state.stepActive)
++		return;
++	state.stepActive = false;
++	if (!state.eventsOnly)
++		WriteStep(mips);
++	++state.step;
++	if (state.step == state.limit) {
++		if (state.eventsOnly && state.kjfsProbeEnabled)
++			OracleFatal("KJFS probe exceeded its instruction limit");
++		Complete();
++		return;
++	}
++	if (state.kjfsProbeStartPending)
++		StartKJFSProbe();
++	if (state.kjfsProbeCallPending)
++		StartKJFSProbeCall();
++}
++
++void PSPRecompOracleSyscall(
++	std::string_view module,
++	const char *name,
++	u32 nid,
++	u32 pc,
++	u32 op,
++	int thread) {
++	if (!state.active || !state.events)
++		return;
++	std::fputs("{\"event\":\"syscall\",\"step\":", state.events);
++	std::fprintf(
++		state.events,
++		"%llu,\"thread\":%d,\"pc\":%u,\"op\":%u,\"module\":",
++		state.step,
++		thread,
++		pc,
++		op);
++	const std::string moduleString(module);
++	WriteJSONString(state.events, moduleString.c_str());
++	std::fputs(",\"name\":", state.events);
++	WriteJSONString(state.events, name ? name : "");
++	std::fprintf(state.events, ",\"nid\":%u}\n", nid);
++}
++
++void PSPRecompOracleSyscallReturn(
++	const char *name,
++	u32 nid,
++	u32 pc,
++	int thread,
++	const u32 arguments[4],
++	u32 result) {
++	ObserveKJFSBlockedSyscallReturn(
++		name, nid, pc, thread, arguments, result);
++}
++
++void PSPRecompOracleThreadSwitch(
++	int from,
++	int to,
++	u32 fromPC,
++	u32 toPC,
++	const char *reason) {
++	if (!state.active || !state.events)
++		return;
++	std::fprintf(
++		state.events,
++		"{\"event\":\"thread_switch\",\"step\":%llu,\"from\":%d,"
++		"\"to\":%d,\"from_pc\":%u,\"to_pc\":%u,\"reason\":",
++		state.step,
++		from,
++		to,
++		fromPC,
++		toPC);
++	WriteJSONString(state.events, reason ? reason : "");
++	std::fputs("}\n", state.events);
++}
+diff --git a/Core/Debugger/PSPRecompOracle.h b/Core/Debugger/PSPRecompOracle.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..c2549395520d4d3a0277b9e7846bf21722a1090c
+--- /dev/null
++++ b/Core/Debugger/PSPRecompOracle.h
+@@ -0,0 +1,33 @@
++// Copyright (c) 2012- PPSSPP Project.
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#pragma once
++
++#include <string_view>
++
++#include "Common/CommonTypes.h"
++
++class MIPSState;
++
++void PSPRecompOracleBeginStep(MIPSState *mips, u32 pc, u32 op);
++void PSPRecompOracleEndStep(MIPSState *mips);
++void PSPRecompOracleSyscall(
++	std::string_view module,
++	const char *name,
++	u32 nid,
++	u32 pc,
++	u32 op,
++	int thread);
++void PSPRecompOracleSyscallReturn(
++	const char *name,
++	u32 nid,
++	u32 pc,
++	int thread,
++	const u32 arguments[4],
++	u32 result);
++void PSPRecompOracleThreadSwitch(
++	int from,
++	int to,
++	u32 fromPC,
++	u32 toPC,
++	const char *reason);
+diff --git a/Core/HLE/HLE.cpp b/Core/HLE/HLE.cpp
+index 944098fab778928cb36d919aa1a7e611f255014f..bb00bb04041378589ca2d109e081f3d8569f10fa 100644
+--- a/Core/HLE/HLE.cpp
++++ b/Core/HLE/HLE.cpp
+@@ -40,6 +40,7 @@
+ #include "Core/HLE/sceKernelThread.h"
+ #include "Core/HLE/sceKernelInterrupt.h"
+ #include "Core/HLE/HLE.h"
++#include "Core/Debugger/PSPRecompOracle.h"
+ 
+ enum {
+ 	// Do nothing after the syscall.
+@@ -76,6 +77,7 @@ static const char *hleAfterSyscallReschedReason;
+ static const HLEFunction *g_stack[MAX_SYSCALL_RECURSION];
+ u32 g_syscallPC;
+ int g_stackSize;
++static u32 g_oracleSyscallResult;
+ 
+ static int idleOp;
+ 
+@@ -862,6 +864,7 @@ static void CallSyscallWithFlags(const HLEFunction *info) {
+ 	} else {
+ 		info->func();
+ 	}
++	g_oracleSyscallResult = currentMIPS->r[MIPS_REG_V0];
+ 
+ 	// Now, g_stackSize should be back to 0. Enable this for "pedantic mode", will find a lot of problems.
+ 	// Check g_stack[0] in the debugger.
+@@ -887,6 +890,7 @@ static void CallSyscallWithoutFlags(const HLEFunction *info) {
+ 	g_syscallPC = currentMIPS->pc;
+ 
+ 	info->func();
++	g_oracleSyscallResult = currentMIPS->r[MIPS_REG_V0];
+ 
+ 	// Now, g_stackSize should be back to 0. Enable this for "pedantic mode", will find a lot of problems.
+ 	// Check g_stack[0] in the debugger.
+@@ -956,18 +960,47 @@ void CallSyscall(MIPSOpcode op) {
+ 		return;
+ 	}
+ 
++	u32 callno = (op >> 6) & 0xFFFFF;
++	int modulenum = (callno & 0xFF000) >> 12;
++	const HLEModule *module = GetHLEModuleByIndex(modulenum);
++	const u32 oraclePC = currentMIPS->pc;
++	const int oracleThread = __KernelGetCurThread();
++	const u32 oracleArguments[4] = {
++		currentMIPS->r[MIPS_REG_A0],
++		currentMIPS->r[MIPS_REG_A1],
++		currentMIPS->r[MIPS_REG_A2],
++		currentMIPS->r[MIPS_REG_A3],
++	};
++	PSPRecompOracleSyscall(
++		module ? module->name : std::string_view("(unknown)"),
++		info->name,
++		info->ID,
++		oraclePC,
++		op.encoding,
++		oracleThread);
++
+ 	if (info->func) {
+-		if (op == idleOp)
++		if (op == idleOp) {
+ 			info->func();
+-		else if (info->flags != 0)
++			g_oracleSyscallResult = currentMIPS->r[MIPS_REG_V0];
++		} else if (info->flags != 0) {
+ 			CallSyscallWithFlags(info);
+-		else
++		} else {
+ 			CallSyscallWithoutFlags(info);
++		}
+ 	} else {
+ 		// We haven't incremented the stack yet.
+ 		RETURN(SCE_KERNEL_ERROR_LIBRARY_NOT_YET_LINKED);
++		g_oracleSyscallResult = currentMIPS->r[MIPS_REG_V0];
+ 		ERROR_LOG_REPORT(Log::HLE, "Unimplemented HLE function %s", info->name ? info->name : "(\?\?\?)");
+ 	}
++	PSPRecompOracleSyscallReturn(
++		info->name,
++		info->ID,
++		oraclePC,
++		oracleThread,
++		oracleArguments,
++		g_oracleSyscallResult);
+ 
+ 	if (coreCollectDebugStats) {
+ 		u32 callno = (op >> 6) & 0xFFFFF; //20 bits
+diff --git a/Core/HLE/sceKernel.h b/Core/HLE/sceKernel.h
+index b1d79f9476ada32ba1f42faf2040171f08120bb8..8bc8bed8b36af857794cf529155b04851c874584 100644
+--- a/Core/HLE/sceKernel.h
++++ b/Core/HLE/sceKernel.h
+@@ -239,6 +239,10 @@ class KernelObjectPool {
+ 		return total;
+ 	}
+ 
++	SceUID GetNextUID() const {
++		return nextID + handleOffset;
++	}
++
+ 	bool GetIDType(SceUID handle, int *type) const {
+ 		if (handle < handleOffset || handle >= handleOffset+maxCount || !occupied[handle-handleOffset]) {
+ 			ERROR_LOG(Log::sceKernel, "Kernel: Bad object handle %i (%08x)", handle, handle);
+diff --git a/Core/HLE/sceKernelThread.cpp b/Core/HLE/sceKernelThread.cpp
+index 4fd2f7526526219780989644c3426e825b8f6bf8..eb8d6f662d087c822ba5846708403bedfe870c68 100644
+--- a/Core/HLE/sceKernelThread.cpp
++++ b/Core/HLE/sceKernelThread.cpp
+@@ -45,6 +45,7 @@
+ #include "Core/HLE/sceKernel.h"
+ #include "Core/HLE/sceKernelMemory.h"
+ #include "Core/HLE/sceKernelThread.h"
++#include "Core/Debugger/PSPRecompOracle.h"
+ #include "Core/HLE/sceKernelModule.h"
+ #include "Core/HLE/sceKernelInterrupt.h"
+ #include "Core/HLE/KernelThreadDebugInterface.h"
+@@ -2922,6 +2923,13 @@ void __KernelSwitchContext(PSPThread *target, const char *reason) {
+ 	else
+ 		__SetCurrentThread(NULL, 0, NULL);
+ 
++	PSPRecompOracleThreadSwitch(
++		oldUID,
++		currentThread,
++		oldPC,
++		currentMIPS->pc,
++		reason);
++
+ 	const bool fromIdle = oldUID == threadIdleID[0] || oldUID == threadIdleID[1];
+ 	const bool toIdle = currentThread == threadIdleID[0] || currentThread == threadIdleID[1];
+ #if DEBUG_LEVEL <= MAX_LOGLEVEL || DEBUG_LOG == NOTICE_LOG
+diff --git a/Core/HLE/sceRtc.cpp b/Core/HLE/sceRtc.cpp
+index 12a2c0adf0697266dfe4906b4bdc83d897d05283..946f92bbd1d2a2568f43a46a1630d83ce1d3635b 100644
+--- a/Core/HLE/sceRtc.cpp
++++ b/Core/HLE/sceRtc.cpp
+@@ -23,8 +23,13 @@
+ #include <sys/time.h>
+ #endif
+ 
++#include <cerrno>
++#include <climits>
++#include <cstdio>
++#include <cstdlib>
+ #include <time.h>
+ 
++#include "Core/Config.h"
+ #include "Common/Serialize/Serializer.h"
+ #include "Common/Serialize/SerializeFuncs.h"
+ #include "Common/TimeUtil.h"
+@@ -50,6 +55,7 @@
+ // This way, time doesn't move strangely with savestates, turbo speed, etc.
+ static PSPTimeval rtcBaseTime;
+ static u64 rtcBaseTicks;
++static bool rtcUseFixedBase;
+ 
+ // Grabbed from JPSCP
+ // This is the # of microseconds between January 1, 0001 and January 1, 1970.
+@@ -147,9 +153,23 @@ void __RtcInit()
+ {
+ 	// This is the base time, the only case we use gettimeofday() for.
+ 	// Everything else is relative to that, "virtual time."
+-	timeval tv;
+-	gettimeofday(&tv, NULL);
+-	rtcBaseTime.tv_sec = tv.tv_sec;
++	const char *fixedEpoch = std::getenv("PSPRECOMP_ORACLE_RTC_EPOCH");
++	if (fixedEpoch && fixedEpoch[0]) {
++		char *end = nullptr;
++		errno = 0;
++		const long long parsed = std::strtoll(fixedEpoch, &end, 10);
++		if (errno || end == fixedEpoch || *end != '\0' || parsed < LONG_MIN || parsed > LONG_MAX) {
++			std::fprintf(stderr, "PSP recomp oracle: invalid RTC epoch: %s\n", fixedEpoch);
++			std::exit(2);
++		}
++		rtcBaseTime.tv_sec = (long)parsed;
++		rtcUseFixedBase = true;
++	} else {
++		timeval tv;
++		gettimeofday(&tv, NULL);
++		rtcBaseTime.tv_sec = tv.tv_sec;
++		rtcUseFixedBase = false;
++	}
+ 	rtcBaseTime.tv_usec = 0;
+ 	// Precalculate the current time in microseconds (rtcMagicOffset is offset to 1970.)
+ 	RtcUpdateBaseTicks();
+@@ -328,7 +348,9 @@ static u32 sceRtcGetCurrentClockLocalTime(u32 pspTimePtr) {
+ 	__RtcTimeOfDay(&tv);
+ 
+ 	time_t sec = (time_t)tv.tv_sec;
+-	const tm *local = localtime(&sec);
++	if (rtcUseFixedBase)
++		sec += (time_t)g_Config.iTimeZone * 60;
++	const tm *local = rtcUseFixedBase ? gmtime(&sec) : localtime(&sec);
+ 	if (!local) {
+ 		return hleLogError(Log::sceRtc, 0, "Date is too high/low to handle, pretending to work");
+ 	}
+diff --git a/Core/MIPS/MIPSInt.cpp b/Core/MIPS/MIPSInt.cpp
+index ba926a7e577b69931644a4198b9b42ddb6859e73..13efe38cadb4e5f7ec355f18fdc05a36d1ec1f42 100644
+--- a/Core/MIPS/MIPSInt.cpp
++++ b/Core/MIPS/MIPSInt.cpp
+@@ -29,6 +29,7 @@
+ #include "Core/MIPS/MIPS.h"
+ #include "Core/MIPS/MIPSCodeUtils.h"
+ #include "Core/MIPS/MIPSInt.h"
++#include "Core/Debugger/PSPRecompOracle.h"
+ #include "Core/MIPS/MIPSTables.h"
+ #include "Core/Reporting.h"
+ #include "Core/HLE/HLE.h"
+@@ -78,6 +79,7 @@ static inline void SkipLikely() {
+ int MIPS_SingleStep()
+ {
+ 	MIPSOpcode op = Memory::Read_Opcode_JIT(mipsr4k.pc);
++	PSPRecompOracleBeginStep(&mipsr4k, mipsr4k.pc, op.encoding);
+ 	if (mipsr4k.inDelaySlot) {
+ 		MIPSInterpret(op);
+ 		if (mipsr4k.inDelaySlot) {
+@@ -87,6 +89,7 @@ int MIPS_SingleStep()
+ 	} else {
+ 		MIPSInterpret(op);
+ 	}
++	PSPRecompOracleEndStep(&mipsr4k);
+ 	return 1;
+ }
+ 
+diff --git a/Core/MIPS/MIPSTables.cpp b/Core/MIPS/MIPSTables.cpp
+index 4e3e820c3077462d94ea3dc88b6b2de5f97d3b7e..7b74ab5c4f915d8af98f6d2fcc68d2c163fe8d2e 100644
+--- a/Core/MIPS/MIPSTables.cpp
++++ b/Core/MIPS/MIPSTables.cpp
+@@ -26,6 +26,7 @@
+ #include "Core/MIPS/MIPSIntVFPU.h"
+ #include "Core/MIPS/MIPSCodeUtils.h"
+ #include "Core/MIPS/MIPSTables.h"
++#include "Core/Debugger/PSPRecompOracle.h"
+ #include "Core/CoreTiming.h"
+ #include "Core/Reporting.h"
+ #include "Core/Debugger/Breakpoints.h"
+@@ -978,6 +979,7 @@ static inline void RunUntilFast() {
+ 
+ 			bool wasInDelaySlot = curMips->inDelaySlot;
+ 			const MIPSInstruction *instr = MIPSGetInstruction(op);
++			PSPRecompOracleBeginStep(curMips, curMips->pc, op.encoding);
+ 			Interpret(instr, op);
+ 			curMips->downcount -= GetInstructionCycleEstimate(instr);
+ 
+@@ -986,6 +988,7 @@ static inline void RunUntilFast() {
+ 				curMips->pc = curMips->nextPC;
+ 				curMips->inDelaySlot = false;
+ 			}
++			PSPRecompOracleEndStep(curMips);
+ 		} while (curMips->inDelaySlot);
+ 	}
+ }
+@@ -1028,6 +1031,7 @@ static void RunUntilWithChecks(u64 globalTicks) {
+ 			}
+ 
+ 			bool wasInDelaySlot = curMips->inDelaySlot;
++			PSPRecompOracleBeginStep(curMips, curMips->pc, op.encoding);
+ 			Interpret(instr, op);
+ 			curMips->downcount -= GetInstructionCycleEstimate(instr);
+ 
+@@ -1036,6 +1040,7 @@ static void RunUntilWithChecks(u64 globalTicks) {
+ 				curMips->pc = curMips->nextPC;
+ 				curMips->inDelaySlot = false;
+ 			}
++			PSPRecompOracleEndStep(curMips);
+ 		} while (curMips->inDelaySlot);
+ 
+ 		if (CoreTiming::GetTicks() > globalTicks)
+diff --git a/Core/Util/BlockAllocator.cpp b/Core/Util/BlockAllocator.cpp
+index a2038f47160cfa543bef184f857a675ce3c5e0ff..75caf0ddc5bf06156c0bb61d8a29a74aa7460755 100644
+--- a/Core/Util/BlockAllocator.cpp
++++ b/Core/Util/BlockAllocator.cpp
+@@ -398,6 +398,11 @@ void BlockAllocator::ListBlocks() const
+ 	DEBUG_LOG(Log::sceKernel,"-----------");
+ }
+ 
++void BlockAllocator::IterateBlocks(BlockVisitor visitor, void *userdata) const {
++	for (const Block *block = bottom_; block != nullptr; block = block->next)
++		visitor(block->start, block->size, block->taken, block->tag, userdata);
++}
++
+ u32 BlockAllocator::GetLargestFreeBlockSize() const
+ {
+ 	u32 maxFreeBlock = 0;
+diff --git a/Core/Util/BlockAllocator.h b/Core/Util/BlockAllocator.h
+index 51a4038ca1144cc04540260710aa46e57dd63cea..e971051609223f433a751077a13d64d76a72413e 100644
+--- a/Core/Util/BlockAllocator.h
++++ b/Core/Util/BlockAllocator.h
+@@ -31,6 +31,13 @@ class BlockAllocator
+ 	void Shutdown();
+ 
+ 	void ListBlocks() const;
++	using BlockVisitor = void (*)(
++		u32 start,
++		u32 size,
++		bool taken,
++		const char *tag,
++		void *userdata);
++	void IterateBlocks(BlockVisitor visitor, void *userdata) const;
+ 
+ 	// WARNING: size can be modified upwards!
+ 	u32 Alloc(u32 &size, bool fromTop = false, const char *tag = 0);
+diff --git a/GPU/GPUCommon.h b/GPU/GPUCommon.h
+index b4e69fb4970def81ec23cad2252cb8179a4bb802..e7291d9e2ca3371b8c2975c86318ddca235d5f5a 100644
+--- a/GPU/GPUCommon.h
++++ b/GPU/GPUCommon.h
+@@ -81,6 +81,9 @@ class GPUCommon : public GPUDebugInterface {
+ 	void EnableInterrupts(bool enable) {
+ 		interruptsEnabled_ = enable;
+ 	}
++	int GetNextListID() const {
++		return nextListID;
++	}
+ 
+ 	virtual void CheckDisplayResized() = 0;
+ 	virtual void CheckConfigChanged(const DisplayLayoutConfig &config) = 0;
+diff --git a/headless/Headless.cpp b/headless/Headless.cpp
+index 293878d5112fceb280b9e02af75191aa483dcf8c..f1b267bb21e2d04dc8209bc72b2d76f1bf616e95 100644
+--- a/headless/Headless.cpp
++++ b/headless/Headless.cpp
+@@ -566,7 +566,10 @@ int main(int argc, const char* argv[])
+ 
+ #if PPSSPP_PLATFORM(WINDOWS)
+ 	// Mount a filesystem
+-	g_Config.memStickDirectory = exePath / "memstick";
++	const char *oracleMemstick = getenv("PSPRECOMP_ORACLE_MEMSTICK");
++	g_Config.memStickDirectory = oracleMemstick && oracleMemstick[0]
++		? Path(oracleMemstick)
++		: exePath / "memstick";
+ 	File::CreateDir(g_Config.memStickDirectory);
+ 	CreateSysDirectories();
+ #elif !PPSSPP_PLATFORM(ANDROID)

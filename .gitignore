@@ -19,6 +19,10 @@
 /memstick/
 /dispatch_dump.bin
 /edram.bin
+*.jsonl
+*.ppm
+*.png
+*.trace
 
 # Reverse-engineering projects and local reports containing derived code.
 *.gpr
