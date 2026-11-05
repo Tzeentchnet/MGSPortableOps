@@ -22,6 +22,7 @@
 *.jsonl
 *.ppm
 *.png
+!/docs/images/*.png
 *.trace
 
 # Reverse-engineering projects and local reports containing derived code.
