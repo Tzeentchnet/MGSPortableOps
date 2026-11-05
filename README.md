@@ -7,25 +7,10 @@ Portable Ops (ULUS-10202 v1.00)** using
 No game executable, generated game C, disc data, save data, trace, or capture
 belongs in this repository. Supply your own supported USA disc image.
 
-## Status
+> **Development build:** first-mission bring-up is working, but this is not yet
+> a playable release. See [project status and next gates](docs/STATUS.md).
 
-**Bootstrap / static translation.**
-
-The supported disc is verified, its executable and module topology are
-inventoried, and the complete main module generates and compiles:
-
-- 19,671 accepted guest functions;
-- 228 generated C chunks plus one registration unit;
-- zero trapping stubs;
-- strict `psp-recomp` revision verification; and
-- successful clang-cl Release compilation.
-
-This is **not yet a bootable or playable release**. Portable Ops' initial
-module-start thread state has not been measured from a PPSSPP interpreter
-trace, so the repository intentionally does not build a standalone game
-driver. See [docs/STATUS.md](docs/STATUS.md).
-
-## Supported input
+## Supported disc
 
 | Property | Required value |
 |---|---|
@@ -47,36 +32,73 @@ file hashes differ.
 - CMake 3.25 or newer and Ninja
 - Visual Studio 2022 Build Tools with clang-cl and a Windows SDK
 
-## Bootstrap
+## Setup manager (recommended)
 
-Initialize the pinned runtime:
-
-```powershell
-git submodule update --init --recursive
-```
-
-Verify and extract private build inputs:
+Run the source-install manager from a clone:
 
 ```powershell
-python tools\mgspo\extract.py `
-  "D:\Games\Metal Gear Solid - Portable Ops (USA).iso"
+python tools\mgspo\manager.py
 ```
 
-Generate the relocated image and native C:
+Windows users can also double-click `Setup.bat` in the repository root.
+
+Select the supported USA ISO, choose the software or experimental D3D12
+runtime, and select **Build & Install**. The manager:
+
+- checks the Visual Studio, clang-cl, Git, CMake, Ninja, and Python tools;
+- verifies the exact ISO size and SHA-1 before extraction;
+- initializes the pinned submodule, extracts private files, generates native
+  code, configures, builds, and stages a local installation;
+- keeps the selected ISO path in ignored `build/mgspo/manager.json`; and
+- can edit restart-required graphics settings, open the native control
+  remapper, and launch the installed runtime.
+
+It does not download tools, copy the ISO into the installation, or make game
+data redistributable. The standard Windows Python distribution must include
+Tkinter. Run `python tools\mgspo\manager.py --diagnose` for a console-only
+requirements check.
+
+For terminal-only extraction, generation, build, installation, and validation,
+see [Advanced installation](docs/ADVANCED_INSTALLATION.md).
+
+## Default controls
+
+| PSP input | Keyboard | XInput-style controller |
+|---|---|---|
+| Analog stick | W/A/S/D | Left stick |
+| D-pad | Arrow keys | D-pad |
+| Start | Enter | Start/Menu |
+| Select | Shift | Back/View |
+| Circle | G | East/B |
+| Cross | Space | South/A |
+| Square | F | West/X |
+| Triangle | R | North/Y |
+| L / R | Q / E | Shoulders or triggers |
+
+Portable Ops uses Circle to confirm its menus.
+
+## Settings
+
+The first interactive launch creates `graphics.ini` and `input.ini` beside
+the executable and opens the graphics and control dialogs. Reopen them
+without starting the game:
 
 ```powershell
-python tools\mgspo\gen.py
+out\build\clang-cl\MGSPortableOps.exe --configure
+out\build\clang-cl\MGSPortableOps.exe --configure-input
 ```
 
-From an x64 Visual Studio developer shell, configure and compile:
+During gameplay, press **F1** to pause guest execution and open the native
+settings hub. Keyboard, mouse, XInput-style controller bindings, dead zones,
+response curves, inversion, and twin-stick options save atomically and apply
+immediately. The remapper accepts up to four comma-separated bindings per
+action; its capture button supports keyboard, mouse, and XInput controls.
 
-```powershell
-cmake --preset clang-cl
-cmake --build --preset clang-cl
-```
-
-Generated and extracted files remain under ignored `build/` and `out/`
-directories.
+Renderer selection, internal resolution (1x-8x), texture upscaling (1x-5x),
+D3D12 shading rate, SMAA, and startup skipping are saved for the next launch.
+The F1 hub enables **Restart Now** whenever saved graphics settings differ
+from the active renderer configuration. Live renderer/resource recreation is
+deliberately not attempted yet.
 
 ## Why `psp-recomp`
 
@@ -94,6 +116,7 @@ are measured independently from the supported disc.
 ## Documentation
 
 - [Status and next gates](docs/STATUS.md)
+- [Advanced installation](docs/ADVANCED_INSTALLATION.md)
 - [Measured findings](docs/FINDINGS.md)
 - [Reproduction steps](docs/REPRODUCTION.md)
 - [Shared-toolkit opportunities](docs/UPSTREAM.md)
