@@ -116,6 +116,7 @@ are measured independently from the supported disc.
 ## Documentation
 
 - [Status and next gates](docs/STATUS.md)
+- [Task list and milestone gates](docs/TODO.md)
 - [Advanced installation](docs/ADVANCED_INSTALLATION.md)
 - [Measured findings](docs/FINDINGS.md)
 - [Reproduction steps](docs/REPRODUCTION.md)

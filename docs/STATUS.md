@@ -189,6 +189,9 @@ performance remain unverified.
 
 ## Next gates
 
+The authoritative task breakdown and milestone exit criteria are maintained
+in [TODO.md](TODO.md).
+
 1. Validate the title-side QAR/DAR consumers, ZLIB output/errors, and SOUND2
    streaming, synchronization, and timing against PPSSPP.
 2. Capture matching PPSSPP software-renderer frames and define objective

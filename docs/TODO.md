@@ -56,8 +56,22 @@ correct.
 - [x] Execute the first correctly initialized guest instruction.
 - [x] Reach the first visible frame.
 
-See [docs/STATUS.md](docs/STATUS.md) and
-[docs/FINDINGS.md](docs/FINDINGS.md) for the proven boundary.
+See [STATUS.md](STATUS.md) and [FINDINGS.md](FINDINGS.md) for the proven
+boundary.
+
+## Current focus
+
+Work proceeds in this order:
+
+1. Validate the title-side QAR/DAR consumers, ZLIB output and errors, and
+   SOUND2 streaming and synchronization against PPSSPP.
+2. Capture matching PPSSPP software-renderer frames and define objective
+   pixel-difference tolerances.
+3. Extend the deterministic mission route through camera, combat, items,
+   interactions, radio, AI, damage, pause/resume, and restart.
+4. Complete three deterministic 10-minute mission runs.
+5. Validate D3D12 against the software and PPSSPP checkpoints.
+6. Profile the measured route and meet the documented 30 FPS thresholds.
 
 ## Milestone 1 - Capture the boot oracle
 
@@ -191,8 +205,9 @@ Exit gate:
 
 ## Milestone 5 - Make the menu flow interactive
 
-- [ ] Map PSP buttons, analog input, dead zones, and repeat behavior.
-- [ ] Support at least one XInput controller and a documented keyboard layout.
+- [x] Map PSP buttons, analog input, and configurable dead zones.
+- [ ] Validate menu key/button repeat behavior against PPSSPP.
+- [x] Support at least one XInput controller and a documented keyboard layout.
 - [ ] Handle controller disconnect/reconnect without hanging guest input.
 - [ ] Match PPSSPP input sampling and frame pacing closely enough for menus and
       gameplay.
@@ -304,11 +319,17 @@ Exit gate:
 - [x] Add a framebuffer-hash test for the stable first-mission checkpoint.
 - [ ] Add framebuffer-hash tests for the earlier stable checkpoints.
 - [x] Add module lifecycle and address-reuse regression tests.
+- [x] Run all 119 Python tests, generation validation, production and D3D12
+      Release builds, both executable contracts, the source-install manager
+      workflow, and the deterministic first-mission smoke route in the current
+      checkout.
 - [ ] Run source tests, generation validation, full Release build, and runtime
       smoke tests from a clean clone.
 - [x] Verify all private/generated artifacts remain ignored.
-- [x] Update `README.md`, `docs/STATUS.md`, `docs/FINDINGS.md`, and
-      `docs/REPRODUCTION.md` with measured commands and results.
+- [x] Update `../README.md`, `STATUS.md`, `FINDINGS.md`, `REPRODUCTION.md`,
+      and `ADVANCED_INSTALLATION.md` with measured commands and results.
+- [x] Keep this authoritative task list under `docs/` and link it from the
+      root README and status page.
 - [x] Record known correctness and performance limitations.
 - [ ] Tag the first-playable milestone only after every definition-of-done item
       passes.
