@@ -1,5 +1,7 @@
 # Metal Gear Solid: Portable Ops Recomp
 
+![Metal Gear Solid: Portable Ops Recomp banner](docs/images/Banner_MGSPO_Recomp.png)
+
 Source-only Windows static recompilation work for **Metal Gear Solid:
 Portable Ops (ULUS-10202 v1.00)** using
 [`psp-recomp`](https://github.com/Tzeentchnet/psp-recomp).
