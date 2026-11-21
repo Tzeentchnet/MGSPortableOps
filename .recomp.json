@@ -1,0 +1,32 @@
+{
+  "$schema": "https://recomp.fyi/schema/v1.json",
+  "game": "Metal Gear Solid: Portable Ops",
+  "system": "PSP",
+  "type": "recomp",
+  "original": {
+    "region": "USA",
+    "revision": "1.00",
+    "serial": "ULUS-10202",
+    "sha1": "706191720f78fe639eac20d3302d03b36a88e8e9"
+  },
+  "project": "Metal Gear Solid: Portable Ops Recomp",
+  "status": "in-progress",
+  "targets": [
+    "Windows"
+  ],
+  "toolchain": "psp-recomp",
+  "approach": "Static recompilation of PSP Allegrex code with a native HLE runtime and software or Direct3D 12 rendering.",
+  "maintainers": [
+    {
+      "name": "Tzeentchnet",
+      "link": "https://github.com/Tzeentchnet"
+    }
+  ],
+  "links": [
+    {
+      "label": "Project status",
+      "url": "https://github.com/Tzeentchnet/MGSPortableOps/blob/main/docs/STATUS.md"
+    }
+  ],
+  "notes": "First-mission bring-up reaches controllable gameplay and the pause menu; broader gameplay, audio, visual, stability, and performance validation remain open."
+}
